@@ -878,6 +878,10 @@ impl SedirApp {
                 None => t.ft8_waiting.to_string(),
             };
             ui.label(RichText::new(text).size(12.0).color(MUTED));
+            if status.delay_s != 0.0 {
+                ui.label(RichText::new(fill(t.ft8_delay, &[&format!("{:+.2}", status.delay_s)])).size(12.0).monospace().color(MUTED))
+                    .on_hover_text(t.ft8_delay_tooltip);
+            }
             // Seconds left in the current slot.
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
             let left = 15.0 - now % 15.0;

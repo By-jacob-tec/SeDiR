@@ -27,6 +27,14 @@ const DECODE_AT_S: f64 = 14.0;
 const KEEP_S: f64 = 32.0;
 /// Messages kept for display.
 const KEEP_MESSAGES: usize = 500;
+/// Dial changes up to this size are followed without starting over (LNB correction).
+const MAX_FOLLOW_HZ: f64 = 2_000.0;
+/// A difference this large between the counted and the clock time starts over.
+const MAX_TIME_JUMP_S: f64 = 2.0;
+/// Weight of each block's clock reading in the buffer's start time.
+const TIME_FOLLOW: f64 = 0.01;
+/// Limits of the learned delay of the signals (satellite path, receiver buffering).
+const DELAY_RANGE_S: (f64, f64) = (-1.0, 2.5);
 
 /// One decoded message.
 #[derive(Clone, Debug, PartialEq)]
@@ -47,6 +55,11 @@ pub struct Ft8Status {
     pub last_count: usize,
     /// Seconds of the slot that arrived (gaps in the stream shorten it).
     pub coverage_s: f64,
+    /// Learned delay of the transmissions behind the computer's clock (seconds): the
+    /// satellite path (~0.25 s on QO-100) plus the receiver's buffering. Slots are taken
+    /// this much later, so whole transmissions fall inside them, and DT is shown
+    /// relative to it.
+    pub delay_s: f64,
 }
 
 /// Shared between the UI and the worker.
@@ -120,6 +133,12 @@ impl Downconverter {
         }
     }
 
+    /// Follows a small change of the centre (the LNB correction moving it) without
+    /// restarting: the mixer keeps its phase, the samples stay continuous.
+    fn retarget(&mut self, center: f64) {
+        self.center = center;
+    }
+
     fn process(&mut self, block: &Block, out: &mut Vec<Complex<f32>>) {
         self.mixer.set(block.center_hz - self.center);
         let mut a = block.samples.to_vec();
@@ -170,38 +189,51 @@ fn run(blocks: Receiver<Block>, me: Ft8) {
             buffer.clear();
             continue;
         }
-        if down.as_ref().is_none_or(|d| d.center != center || d.input_rate != block.sample_rate) {
-            down = Some(Downconverter::new(center, &block));
-            buffer.clear();
+        // The beacon lock moves the dial by some Hz every few seconds: that is followed
+        // in place (it also takes the LNB's drift out of the tones during a slot). Only
+        // a real retune or a new sample rate starts over.
+        match down.as_mut() {
+            Some(d) if d.input_rate == block.sample_rate && (d.center - center).abs() < MAX_FOLLOW_HZ => d.retarget(center),
+            _ => {
+                down = Some(Downconverter::new(center, &block));
+                buffer.clear();
+            }
         }
         let d = down.as_mut().expect("downconverter");
         chunk.clear();
         d.process(&block, &mut chunk);
 
-        // Time stamps: the block ended about when it arrived. While the stream runs
-        // without gaps, samples are counted on from the first; a gap or a jump of the
-        // clock starts the count again.
-        let block_start = arrived - block.samples.len() as f64 / block.sample_rate;
-        let buffer_end = buffer_start + buffer.len() as f64 / RATE;
-        if buffer.is_empty() || (block_start - buffer_end).abs() > 0.25 {
-            buffer.clear();
-            buffer_start = block_start;
-        }
+        // Time stamps: the newest sample arrived about now. The buffer's start time
+        // follows that estimate slowly, which averages the arrival jitter and lets the
+        // SDR's and the computer's clocks differ (the stream ran at 99.8 % of nominal);
+        // only a jump of seconds (a stall, a clock change) starts over.
         buffer.extend(chunk.iter().copied());
+        let estimate = arrived - buffer.len() as f64 / RATE;
+        if buffer.len() == chunk.len() || (estimate - buffer_start).abs() > MAX_TIME_JUMP_S {
+            buffer.clear();
+            buffer.extend(chunk.iter().copied());
+            buffer_start = estimate;
+        } else {
+            buffer_start += (estimate - buffer_start) * TIME_FOLLOW;
+        }
         let excess = buffer.len().saturating_sub((KEEP_S * RATE) as usize);
         if excess > 0 {
             buffer.drain(..excess);
             buffer_start += excess as f64 / RATE;
         }
 
-        // Decode a slot once DECODE_AT_S of it has arrived.
+        // Decode a slot once DECODE_AT_S of it has arrived, counting from where the
+        // transmissions actually begin (the learned delay later than the clock's slot).
+        let delay = me.status.lock().unwrap().delay_s;
         let latest = buffer_start + buffer.len() as f64 / RATE;
-        let slot = ((latest - DECODE_AT_S) / SLOT_SECONDS).floor() * SLOT_SECONDS;
-        if slot <= 0.0 || decoded_slot == Some(slot as u64) || latest < slot + DECODE_AT_S {
+        let slot = ((latest - delay - DECODE_AT_S) / SLOT_SECONDS).floor() * SLOT_SECONDS;
+        // A learned delay that grows can make the same slot (or an earlier one) come round
+        // again: only later slots are taken.
+        if slot <= 0.0 || decoded_slot.is_some_and(|d| slot as u64 <= d) || latest < slot + delay + DECODE_AT_S {
             continue;
         }
         decoded_slot = Some(slot as u64);
-        let first = ((slot - buffer_start) * RATE).round() as isize;
+        let first = ((slot + delay - buffer_start) * RATE).round() as isize;
         let count = (DECODE_AT_S * RATE) as usize;
         // Slot samples; missing ones (before the buffer began) are zero.
         let samples: Vec<Complex<f32>> = (0..count as isize)
@@ -233,7 +265,18 @@ fn run(blocks: Receiver<Block>, me: Ft8) {
             }
             let excess = messages.len().saturating_sub(KEEP_MESSAGES);
             messages.drain(..excess);
-            *me2.status.lock().unwrap() = Ft8Status { last_slot: Some(slot_secs), last_count: found.len(), coverage_s: coverage };
+            drop(messages);
+            let mut status = me2.status.lock().unwrap();
+            // Learn the delay from where the decoded transmissions began: the median DT
+            // of the slot moves it most of the way (senders' own clock errors average out).
+            let mut dts: Vec<f64> = found.iter().map(|d| d.dt_s as f64).collect();
+            dts.sort_by(f64::total_cmp);
+            if let Some(&median) = dts.get(dts.len() / 2) {
+                status.delay_s = (status.delay_s + 0.7 * median).clamp(DELAY_RANGE_S.0, DELAY_RANGE_S.1);
+            }
+            status.last_slot = Some(slot_secs);
+            status.last_count = found.len();
+            status.coverage_s = coverage;
         });
     }
 }
@@ -291,9 +334,18 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(32);
         handle.commands.send(Command::Subscribe(10, tx)).unwrap();
         ft8.spawn(rx);
-        ft8.set_dial(Some(10_489.540e6 - lo - correction));
-        for _ in 0..40 {
+        // As the window does: the dial follows the beacon correction every second.
+        let seconds: u64 = std::env::var("SEDIR_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        let mut last_slot = None;
+        for _ in 0..seconds {
+            let c = state.lock().unwrap().correction_hz.unwrap_or(correction);
+            ft8.set_dial(Some(10_489.540e6 - lo - c));
             thread::sleep(Duration::from_secs(1));
+            let s = ft8.status();
+            if s.last_slot != last_slot {
+                last_slot = s.last_slot;
+                println!("slot {:?}: {} messages, {:.1} s arrived, delay {:+.2} s, LNB {c:+.0} Hz", s.last_slot.map(|v| v % 86_400), s.last_count, s.coverage_s, s.delay_s);
+            }
         }
         println!("{:?}", ft8.status());
         for m in ft8.messages() {
