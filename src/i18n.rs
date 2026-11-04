@@ -227,7 +227,7 @@ pub static EN: Strings = Strings {
     auto_mode_tooltip: "When a signal is clicked, its kind is measured and the mode, filter and tuning are set to match.",
     recognising: "Recognising the signal…",
     recognised: "{} · {}% sure · {}",
-    not_recognised: "Could not measure the signal (it moved out of the band).",
+    not_recognised: "No clear signal where clicked (empty, too weak, or out of the band); the mode is kept.",
     reasons: [
         "wide",
         "constant amplitude",
@@ -332,7 +332,7 @@ pub static TR: Strings = Strings {
     auto_mode_tooltip: "Bir sinyale tıklayınca türü ölçülür; tür, filtre ve frekans ona göre ayarlanır.",
     recognising: "Sinyal tanınıyor…",
     recognised: "{} · %{} emin · {}",
-    not_recognised: "Sinyal ölçülemedi (bant dışına çıktı).",
+    not_recognised: "Tıklanan yerde belirgin sinyal yok (boş, çok zayıf ya da bant dışı); tür değiştirilmedi.",
     reasons: [
         "geniş",
         "sabit genlik",

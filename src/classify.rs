@@ -13,8 +13,15 @@ use crate::demod::{FirDecimator, Mixer, Mode, halfband, lowpass, taps_for};
 use crate::dsp::Spectrum;
 use crate::source::Block;
 
-/// Signal analysed (seconds): enough speech for the SSB pitch search.
-const ANALYSIS_SECONDS: f64 = 1.2;
+/// Signal analysed (seconds): enough speech for the SSB pitch search (on the air a
+/// speaker was silent three quarters of 1.2 s).
+const ANALYSIS_SECONDS: f64 = 1.6;
+/// A signal must stand this far over the noise (strongest bin over the median) to be
+/// classified.
+const MIN_SNR_DB: f32 = 10.0;
+/// Audio frequency where the speech of an SSB signal begins (transmit filters cut
+/// between ~100 and ~400 Hz).
+const SSB_SPEECH_START_HZ: f64 = 300.0;
 /// Spectra averaged over that time.
 const SPECTRA: f64 = 8.0;
 
@@ -95,16 +102,28 @@ pub fn measure(samples: &[Complex<f32>], rate: f64, focus_hz: f64) -> Option<Fea
     let bin = rate / n as f64;
     let freq = |i: usize| (i as f64 - n as f64 / 2.0) * bin;
     let power: Vec<f64> = db.iter().map(|&d| 10f64.powf(d as f64 / 10.0)).collect();
+    // Most of the analysis band is noise: its median is the noise level. (A low percentile
+    // put the level under the noise's own ripple, and noise then passed for signal.)
     let mut sorted = power.clone();
     sorted.sort_by(f64::total_cmp);
-    let noise = sorted[sorted.len() / 5].max(1e-30);
+    let noise = sorted[sorted.len() / 2].max(1e-30);
+    // For the edges, the spectrum smoothed over ~25 Hz: few spectra are averaged, so
+    // single noise bins jump several dB.
+    let half_window = ((12.5 / bin).round() as usize).max(1);
+    let smooth: Vec<f64> = (0..n)
+        .map(|i| {
+            let (a, b) = (i.saturating_sub(half_window), (i + half_window).min(n - 1));
+            power[a..=b].iter().sum::<f64>() / (b - a + 1) as f64
+        })
+        .collect();
 
-    // The occupied band grows from the strongest bin while bins stand 6 dB over the noise,
-    // across gaps of up to 1 % of the analysis band.
+    // The occupied band grows from the strongest bin while the smoothed spectrum stands
+    // 8 dB over the noise, across gaps of up to 350 Hz (between the harmonics of a deep
+    // voice, which can be 300 Hz apart).
     let reach = ((focus_hz / bin) as usize).clamp(2, n / 2 - 1);
     let peak = (n / 2 - reach..=n / 2 + reach).max_by(|&a, &b| power[a].total_cmp(&power[b]))?;
-    let above = |i: usize| power[i] > noise * 4.0;
-    let gap = (n / 100).max(3);
+    let above = |i: usize| smooth[i] > noise * 6.3;
+    let gap = ((350.0 / bin) as usize).max(3);
     let grow = |step: isize| {
         let (mut edge, mut i, mut missed) = (peak as isize, peak as isize, 0usize);
         loop {
@@ -125,7 +144,9 @@ pub fn measure(samples: &[Complex<f32>], rate: f64, focus_hz: f64) -> Option<Fea
     };
     let (lo, hi) = (grow(-1), grow(1));
     let outer_width = (hi - lo + 1) as f64 * bin;
-    let excess = |i: usize| (power[i] - noise).max(0.0);
+    // Power over the noise, counted only where the signal stands out (noise ripple inside
+    // the band would otherwise add up).
+    let excess = |i: usize| if above(i) || i == peak { (power[i] - noise).max(0.0) } else { 0.0 };
     // Within that, the 99.9 % power band: skirts (window leakage, key clicks) of strong
     // signals carry little power but would stretch the edges, while AM sidebands next to
     // a strong carrier (a few % of the power) are kept.
@@ -276,9 +297,9 @@ pub fn decide(f: &Features, center_hz: f64) -> Classification {
         };
         let bw = (width + 150.0).clamp(1.8e3, 3.6e3);
         if upper {
-            (Mode::Usb, 0.7, abs(f.lo_hz) - 250.0, bw)
+            (Mode::Usb, 0.7, abs(f.lo_hz) - SSB_SPEECH_START_HZ, bw)
         } else {
-            (Mode::Lsb, 0.7, abs(f.hi_hz) + 250.0, bw)
+            (Mode::Lsb, 0.7, abs(f.hi_hz) + SSB_SPEECH_START_HZ, bw)
         }
     } else {
         // Between narrow FM and AM without a clear carrier: the band plan decides.
@@ -332,10 +353,15 @@ pub fn ssb_pitch_offset(samples: &[Complex<f32>], rate: f64, dial_hz: f64, upper
         s.iter_mut().for_each(|v| *v -= mid);
         frames.push((energy, s));
     }
-    // Voiced, loud frames only.
+    // Frames with speech: 6 dB louder than the quiet ones (the 20th percentile is the
+    // pauses; speakers on the air paused most of the time).
     let mut energies: Vec<f32> = frames.iter().map(|f| f.0).collect();
     energies.sort_by(f32::total_cmp);
-    let cut = *energies.get(energies.len() * 2 / 5)?;
+    let quiet = *energies.get(energies.len() / 5)?;
+    let loudest = *energies.last()?;
+    // Without pauses (continuous speech) the quiet frames are speech too: then a quarter
+    // of the loudest frame's energy is enough.
+    let cut = (quiet * 4.0).min(loudest * 0.25);
     let voiced: Vec<&Vec<f32>> = frames.iter().filter(|f| f.0 >= cut && f.0 > 0.0).map(|f| &f.1).collect();
     if voiced.len() < 4 {
         return None;
@@ -348,7 +374,8 @@ pub fn ssb_pitch_offset(samples: &[Complex<f32>], rate: f64, dial_hz: f64, upper
             let lo = (150.0 / bin) as usize;
             let hi = ((1600.0 / bin) as usize).min(s.len() - 2);
             (lo.max(1)..hi)
-                .filter(|&i| s[i] > 1.0 && s[i] > s[i - 1] && s[i] >= s[i + 1])
+                // ~7 dB over the frame's median: harmonics on the air stood 15-20 dB out.
+                .filter(|&i| s[i] > 0.6 && s[i] > s[i - 1] && s[i] >= s[i + 1])
                 .map(|i| {
                     let (a, b, c) = (s[i - 1], s[i], s[i + 1]);
                     let d = a - 2.0 * b + c;
@@ -468,7 +495,13 @@ pub fn load_analysis(cf32: &std::path::Path) -> Option<(Vec<Complex<f32>>, f64, 
 /// radio frequency of the samples' centre.
 pub fn classify_samples(samples: &[Complex<f32>], rate: f64, center_hz: f64, width_hz: f64) -> Option<Classification> {
     let focus = (width_hz / 2.0 + 300.0).max(500.0);
-    let mut c = decide(&measure(samples, rate, focus)?, center_hz);
+    let features = measure(samples, rate, focus)?;
+    // Nothing clearly over the noise where it was clicked: the strongest bin of pure
+    // noise stands 5-7 dB over its median, and its flicker would pass for keying.
+    if features.snr_db < MIN_SNR_DB {
+        return None;
+    }
+    let mut c = decide(&features, center_hz);
     if matches!(c.mode, Mode::Usb | Mode::Lsb) {
         let upper = c.mode == Mode::Usb;
         let dial = c.frequency_hz - center_hz;
@@ -741,6 +774,46 @@ mod tests {
             }
             println!("  final: {:?}", classify_samples(&samples, rate, center, width));
         }
+    }
+
+    /// Spectrum profile and loudness over time of one saved analysis:
+    /// `SEDIR_FILE=path.cf32 cargo test --lib analysis_profile -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn analysis_profile() {
+        let Some(path) = std::env::var_os("SEDIR_FILE") else { return };
+        let (samples, rate, center, _) = load_analysis(std::path::Path::new(&path)).unwrap();
+        let n = 4096;
+        let mut s = Spectrum::new(n);
+        s.push(&samples);
+        let db = s.take().unwrap();
+        let bin = rate / n as f64;
+        let mut sorted = db.clone();
+        sorted.sort_by(f32::total_cmp);
+        let noise = sorted[n / 5];
+        println!("centre {center:.0} Hz, 100 Hz slices (dB over noise, max in slice):");
+        let mut line = String::new();
+        for k in -40..60 {
+            let lo = ((k as f64 * 100.0) / bin + n as f64 / 2.0) as usize;
+            let hi = (((k + 1) as f64 * 100.0) / bin + n as f64 / 2.0) as usize;
+            let m = db[lo..hi].iter().copied().fold(f32::MIN, f32::max) - noise;
+            line += &format!("{:+5}:{:>3.0} ", k * 100, m);
+            if (k + 41) % 10 == 0 {
+                println!("{line}");
+                line.clear();
+            }
+        }
+        // Loudness of the band -1..+4 kHz every 50 ms.
+        let step = (rate * 0.05) as usize;
+        let levels: Vec<String> = samples.chunks(step).map(|c| format!("{:.0}", 10.0 * (c.iter().map(|z| z.norm_sqr()).sum::<f32>() / c.len() as f32).log10())).collect();
+        println!("level every 50 ms (dBFS, whole analysis band): {}", levels.join(" "));
+    }
+
+    #[test]
+    fn noise_alone_is_not_classified() {
+        let n = (RATE * ANALYSIS_SECONDS) as usize;
+        let samples = noise(n, 0.01);
+        assert_eq!(classify_samples(&samples, RATE, 10489.8e6, 3e3), None);
     }
 
     #[test]
