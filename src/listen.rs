@@ -38,11 +38,21 @@ pub struct ListenSettings {
 }
 
 /// Shared between the UI and the thread.
+/// Text decoded from a CW signal.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CwInfo {
+    pub text: String,
+    pub wpm: f64,
+    pub key_down: bool,
+    pub signal: bool,
+}
+
 #[derive(Clone)]
 pub struct Listener {
     pub settings: Arc<Mutex<ListenSettings>>,
     level: Arc<AtomicU32>,
     rds: Arc<Mutex<Option<RdsInfo>>>,
+    cw: Arc<Mutex<Option<CwInfo>>>,
 }
 
 impl Listener {
@@ -51,7 +61,13 @@ impl Listener {
             settings: Arc::new(Mutex::new(settings)),
             level: Arc::new(AtomicU32::new((-150.0f32).to_bits())),
             rds: Arc::new(Mutex::new(None)),
+            cw: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Text decoded from the CW signal listened to, None in other modes.
+    pub fn cw(&self) -> Option<CwInfo> {
+        self.cw.lock().unwrap().clone()
     }
 
     /// RDS of the station listened to (WFM), None in other modes.
@@ -186,6 +202,9 @@ fn run(blocks: Receiver<Block>, me: Listener, audio: AudioBuffer, stations: Stat
             if chain.rds.is_some() {
                 chain.rds = Some(RdsDecoder::new(chain.channel_rate()));
             }
+            if chain.cw.is_some() {
+                chain.cw = Some(crate::cw::CwDecoder::new(chain.channel_rate()));
+            }
         }
         let offset = s.frequency_hz - block.center_hz;
         if offset.abs() > block.sample_rate / 2.0 {
@@ -211,5 +230,7 @@ fn run(blocks: Receiver<Block>, me: Listener, audio: AudioBuffer, stations: Stat
             stations.record(s.frequency_hz, name);
         }
         *me.rds.lock().unwrap() = info;
+        *me.cw.lock().unwrap() =
+            chain.cw.as_ref().map(|d| CwInfo { text: d.text().to_string(), wpm: d.wpm(), key_down: d.key_down(), signal: d.signal });
     }
 }

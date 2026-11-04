@@ -192,8 +192,8 @@ impl Mode {
             Mode::Wfm => 100e3,
             Mode::Nfm => 12.5e3,
             Mode::Am => 5e3,
-            Mode::Usb | Mode::Lsb => 100.0,
-            Mode::Cw => 50.0,
+            // Fine enough to correct an SSB voice's pitch by ear (Shift gives 100 Hz).
+            Mode::Usb | Mode::Lsb | Mode::Cw => 10.0,
         }
     }
 
@@ -350,6 +350,8 @@ pub struct Chain {
     pub level_db: f32,
     /// RDS of the station listened to (WFM only).
     pub rds: Option<crate::rds::RdsDecoder>,
+    /// Morse to text (CW only).
+    pub cw: Option<crate::cw::CwDecoder>,
     mpx: Vec<f32>,
     scratch: Vec<Complex<f32>>,
     scratch2: Vec<Complex<f32>>,
@@ -415,6 +417,7 @@ impl Chain {
             resampler: Resampler { pos: 0.0, prev: 0.0 },
             level_db: -150.0,
             rds: (mode == Mode::Wfm).then(|| crate::rds::RdsDecoder::new(rate)),
+            cw: (mode == Mode::Cw).then(|| crate::cw::CwDecoder::new(rate)),
             mpx: Vec::new(),
             scratch: Vec::new(),
             scratch2: Vec::new(),
@@ -449,6 +452,9 @@ impl Chain {
         b.clear();
         self.channel.process(&a, &mut b);
         let channel = &mut b;
+        if let Some(cw) = &mut self.cw {
+            cw.push(channel);
+        }
         let power = channel.iter().map(|z| z.norm_sqr()).sum::<f32>() / channel.len().max(1) as f32;
         self.level_db = 10.0 * (power + 1e-20).log10();
 

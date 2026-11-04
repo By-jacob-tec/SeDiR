@@ -5,6 +5,7 @@ pub mod audio;
 pub mod bandplan;
 pub mod beacon;
 pub mod classify;
+pub mod cw;
 pub mod demod;
 pub mod detect;
 pub mod device;

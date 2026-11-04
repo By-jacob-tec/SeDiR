@@ -1330,6 +1330,32 @@ impl SedirApp {
         });
     }
 
+    /// Text decoded from the CW signal listened to, with its speed and a key light.
+    fn cw_bar(&self, ui: &mut egui::Ui) {
+        let t = self.t();
+        let info = self.listener.cw().unwrap_or_default();
+        ui.horizontal(|ui| {
+            let badge = egui::Button::new(RichText::new("CW").size(11.0).strong().color(DEEP))
+                .fill(if info.signal { ACCENT } else { MUTED })
+                .corner_radius(4)
+                .sense(Sense::hover());
+            ui.add(badge).on_hover_text(t.cw_tooltip);
+            dot(ui, if info.key_down { AMBER } else { MUTED.gamma_multiply(0.4) });
+            if info.signal {
+                ui.label(RichText::new(format!("{:.0} WPM", info.wpm)).size(12.0).monospace().color(MUTED));
+            }
+            if info.text.is_empty() {
+                ui.label(RichText::new(t.cw_waiting).size(12.0).color(MUTED));
+            } else {
+                // The latest text, right-aligned so new letters stay in view.
+                let width = ui.available_width();
+                let chars = (width / 9.5) as usize;
+                let shown: String = info.text.chars().rev().take(chars).collect::<Vec<_>>().into_iter().rev().collect();
+                ui.label(RichText::new(shown).size(16.0).monospace().color(TEXT));
+            }
+        });
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
         let t = self.t();
         ui.horizontal(|ui| {
@@ -1389,6 +1415,11 @@ impl eframe::App for SedirApp {
                 .frame(egui::Frame::new().fill(CARD).inner_margin(egui::Margin::symmetric(14, 6)))
                 .show(ui, |ui| self.rds_bar(ui));
         }
+        if self.mode == Mode::Cw && self.opened {
+            egui::Panel::bottom("cw")
+                .frame(egui::Frame::new().fill(CARD).inner_margin(egui::Margin::symmetric(14, 6)))
+                .show(ui, |ui| self.cw_bar(ui));
+        }
         egui::Panel::left("sidebar")
             .resizable(true)
             .default_size(310.0)
@@ -1411,6 +1442,7 @@ fn reason_text(r: Reason, t: &Strings) -> &'static str {
         Reason::NarrowCarrier => 5,
         Reason::Keyed => 6,
         Reason::BandPlan => 7,
+        Reason::VoicePitch => 8,
     };
     t.reasons[i]
 }

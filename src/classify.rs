@@ -2,7 +2,7 @@
 //! (occupied band, carrier, one-sidedness, envelope, keying) and the measurements,
 //! with the band plan as a tie-breaker, give the mode and where to tune.
 
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,8 +13,8 @@ use crate::demod::{FirDecimator, Mixer, Mode, halfband, lowpass, taps_for};
 use crate::dsp::Spectrum;
 use crate::source::Block;
 
-/// Signal analysed (seconds).
-const ANALYSIS_SECONDS: f64 = 0.7;
+/// Signal analysed (seconds): enough speech for the SSB pitch search.
+const ANALYSIS_SECONDS: f64 = 1.2;
 /// Spectra averaged over that time.
 const SPECTRA: f64 = 8.0;
 
@@ -37,6 +37,8 @@ pub enum Reason {
     Keyed,
     /// The band plan decided between close candidates.
     BandPlan,
+    /// The SSB carrier was placed from the harmonics of the speaker's voice.
+    VoicePitch,
 }
 
 /// Measurements of a signal (frequencies relative to the analysis centre, Hz).
@@ -79,8 +81,10 @@ pub struct Classification {
     pub reasons: Vec<Reason>,
 }
 
-/// Measures `samples` (complex baseband at `rate`, the signal near 0 Hz).
-pub fn measure(samples: &[Complex<f32>], rate: f64) -> Option<Features> {
+/// Measures `samples` (complex baseband at `rate`, the signal near 0 Hz). The signal is
+/// looked for only within `focus_hz` of the centre: the analysis band also holds the
+/// neighbours, and a stronger one (a beacon 18 kHz away) must not be taken instead.
+pub fn measure(samples: &[Complex<f32>], rate: f64, focus_hz: f64) -> Option<Features> {
     let n = ((rate * ANALYSIS_SECONDS / SPECTRA) as usize).next_power_of_two().clamp(512, 1 << 16);
     if samples.len() < 2 * n {
         return None;
@@ -97,7 +101,8 @@ pub fn measure(samples: &[Complex<f32>], rate: f64) -> Option<Features> {
 
     // The occupied band grows from the strongest bin while bins stand 6 dB over the noise,
     // across gaps of up to 1 % of the analysis band.
-    let peak = (0..n).max_by(|&a, &b| power[a].total_cmp(&power[b]))?;
+    let reach = ((focus_hz / bin) as usize).clamp(2, n / 2 - 1);
+    let peak = (n / 2 - reach..=n / 2 + reach).max_by(|&a, &b| power[a].total_cmp(&power[b]))?;
     let above = |i: usize| power[i] > noise * 4.0;
     let gap = (n / 100).max(3);
     let grow = |step: isize| {
@@ -229,8 +234,9 @@ pub fn decide(f: &Features, center_hz: f64) -> Classification {
         reasons.push(Reason::ConstantEnvelope);
         let center = abs((f.lo_hz + f.hi_hz) / 2.0);
         (Mode::Nfm, 0.8, Mode::Nfm.round_to_channel(center), (width * 1.3).clamp(8e3, 25e3))
-    } else if width <= 4.5e3 {
-        // Single sideband. The sideband is a convention of the band (LSB below 10 MHz on
+    } else if width <= 4.5e3 || (matches!(hint, Some(Mode::Usb | Mode::Lsb)) && width <= 8e3) {
+        // Single sideband (splatter or a neighbour can make it look wider where the band
+        // plan expects it). The sideband is a convention of the band (LSB below 10 MHz on
         // the amateur bands, USB above and on QO-100), which the band plan knows; the
         // spectrum alone is a weak guide, as compressed or pre-emphasised speech is not
         // reliably strongest beside the carrier (on QO-100 it pointed the wrong way). It
@@ -274,17 +280,149 @@ pub fn decide(f: &Features, center_hz: f64) -> Classification {
     Classification { mode, confidence, frequency_hz: frequency.round(), bandwidth_hz: bandwidth, reasons }
 }
 
+/// Correction (Hz) of an SSB dial frequency from the speaker's voice. Voiced speech is a
+/// series of harmonics k·f0; only with the dial on the suppressed carrier do they sit at
+/// exactly k·f0 in the audio, a mistuning δ puts them at k·f0 + δ. One frame cannot tell
+/// δ from δ + f0 (the comb just shifts by one harmonic), but f0 moves with intonation,
+/// and only the true δ lines up in every frame: the δ with the best summed fit over
+/// all voiced frames is taken. `dial_hz` is the rough dial relative to the samples'
+/// centre; the result is to be added to it (USB) or subtracted from it (LSB).
+pub fn ssb_pitch_offset(samples: &[Complex<f32>], rate: f64, dial_hz: f64, upper: bool) -> Option<f64> {
+    use rustfft::FftPlanner;
+    let mut x = samples.to_vec();
+    Mixer::new(-dial_hz, rate).mix(&mut x);
+    if !upper {
+        x.iter_mut().for_each(|z| *z = z.conj());
+    }
+    // ~40 ms frames, half overlapping: short enough that the pitch barely moves within
+    // one (longer frames smear the upper harmonics), long enough to separate harmonics
+    // of a 75 Hz voice.
+    let n = ((rate * 0.03) as usize).next_power_of_two();
+    let bin = rate / n as f64;
+    let top_bin = (3400.0 / bin) as usize;
+    let fft = FftPlanner::new().plan_fft_forward(n);
+    let window: Vec<f32> = (0..n).map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos()).collect();
+    let mut frames: Vec<(f32, Vec<f32>)> = Vec::new();
+    for start in (0..x.len().saturating_sub(n)).step_by(n / 2) {
+        let mut buf: Vec<Complex<f32>> = x[start..start + n].iter().zip(&window).map(|(z, w)| z * w).collect();
+        fft.process(&mut buf);
+        let mag: Vec<f32> = buf[..top_bin].iter().map(|z| z.norm()).collect();
+        let energy: f32 = mag[(150.0 / bin) as usize..].iter().map(|m| m * m).sum();
+        // Log magnitude over the frame's median, minus its own median: noise scores about
+        // zero, so a comb gains only from the harmonics it hits, not from how many
+        // positions it samples.
+        let mut sorted = mag.clone();
+        sorted.sort_by(f32::total_cmp);
+        let floor = sorted[sorted.len() / 2].max(1e-12);
+        let mut s: Vec<f32> = mag.iter().map(|m| (1.0 + m / floor).ln()).collect();
+        let mut sorted_s = s.clone();
+        sorted_s.sort_by(f32::total_cmp);
+        let mid = sorted_s[sorted_s.len() / 2];
+        s.iter_mut().for_each(|v| *v -= mid);
+        frames.push((energy, s));
+    }
+    // Voiced, loud frames only.
+    let mut energies: Vec<f32> = frames.iter().map(|f| f.0).collect();
+    energies.sort_by(f32::total_cmp);
+    let cut = *energies.get(energies.len() * 2 / 5)?;
+    let voiced: Vec<&Vec<f32>> = frames.iter().filter(|f| f.0 >= cut && f.0 > 0.0).map(|f| &f.1).collect();
+    if voiced.len() < 4 {
+        return None;
+    }
+    // Harmonic peaks of each voiced frame, placed between bins (parabola on the log
+    // values): a few Hz precise. Only below 1.6 kHz, where a moving pitch smears least.
+    let peaks: Vec<Vec<f64>> = voiced
+        .iter()
+        .map(|s| {
+            let lo = (150.0 / bin) as usize;
+            let hi = ((1600.0 / bin) as usize).min(s.len() - 2);
+            (lo.max(1)..hi)
+                .filter(|&i| s[i] > 1.0 && s[i] > s[i - 1] && s[i] >= s[i + 1])
+                .map(|i| {
+                    let (a, b, c) = (s[i - 1], s[i], s[i + 1]);
+                    let d = a - 2.0 * b + c;
+                    let off = if d.abs() > 1e-9 { (0.5 * (a - c) / d).clamp(-0.5, 0.5) } else { 0.0 };
+                    (i as f64 + off as f64) * bin
+                })
+                .collect()
+        })
+        .filter(|p: &Vec<f64>| p.len() >= 3)
+        .collect();
+    if peaks.len() < 4 {
+        return None;
+    }
+    // Squared distance of the peaks, less δ, from the nearest harmonic of the frame's
+    // best f0; capped, so a stray peak costs a fixed amount.
+    const CAP: f64 = 20.0 * 20.0;
+    let misfit = |p: &Vec<f64>, delta: f64| {
+        (0..300)
+            .map(|j| {
+                let f0 = 75.0 + j as f64 * 0.75;
+                p.iter()
+                    .map(|&h| {
+                        let x = h - delta;
+                        let k = (x / f0).round();
+                        if k < 1.0 { CAP } else { (x - k * f0).powi(2).min(CAP) }
+                    })
+                    .sum::<f64>()
+                    / p.len() as f64
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    let deltas: Vec<f64> = (-70..=70).map(|i| i as f64 * 5.0).collect();
+    // Higher is better: the negative mean misfit over the frames.
+    let totals: Vec<f32> = deltas.iter().map(|&d| -(peaks.iter().map(|p| misfit(p, d)).sum::<f64>() / peaks.len() as f64) as f32).collect();
+    let best = (0..deltas.len()).max_by(|&a, &b| totals[a].total_cmp(&totals[b]))?;
+    // Only a clear winner: the best offset more than 40 Hz away must fit clearly worse
+    // (a steady pitch cannot tell δ from δ ± f0), and the winner not at the search edge.
+    let rival = (0..deltas.len()).filter(|&i| (deltas[i] - deltas[best]).abs() >= 40.0).map(|i| totals[i]).fold(f32::NEG_INFINITY, f32::max);
+    let clear = totals[best] > rival + 15.0 && totals[best] > -120.0 && best > 0 && best < deltas.len() - 1;
+    #[cfg(test)]
+    {
+        let mut order: Vec<usize> = (0..deltas.len()).collect();
+        order.sort_by(|&a, &b| totals[b].total_cmp(&totals[a]));
+        let top: Vec<String> = order.iter().take(6).map(|&i| format!("{:+.0}:{:.1}", deltas[i], totals[i])).collect();
+        println!("pitch: {} voiced frames, top {}, rival {rival:.1}, clear {clear}", voiced.len(), top.join(" "));
+    }
+    clear.then_some(deltas[best])
+}
+
 /// Collects the signal around `hz` (receiver frequency) from source blocks and classifies
 /// it. `width_hz` is the rough width seen on the spectrum; `lo_hz` the converter offset,
 /// added to give radio frequencies (for the band plan and the result). Returns None if
 /// the band moved away meanwhile.
 pub fn spawn_job(blocks: Receiver<Block>, hz: f64, width_hz: f64, lo_hz: f64) -> Receiver<Option<Classification>> {
     let (tx, rx) = mpsc::sync_channel(1);
-    thread::Builder::new().name("classify".into()).spawn(move || job(blocks, hz, width_hz, lo_hz, tx)).expect("classify thread");
+    thread::Builder::new()
+        .name("classify".into())
+        .spawn(move || {
+            let verdict = collect(blocks, hz, width_hz).and_then(|(samples, rate)| classify_samples(&samples, rate, hz + lo_hz, width_hz));
+            let _ = tx.send(verdict);
+        })
+        .expect("classify thread");
     rx
 }
 
-fn job(blocks: Receiver<Block>, hz: f64, width_hz: f64, lo_hz: f64, result: SyncSender<Option<Classification>>) {
+/// Measures and decides, then for SSB places the dial from the voice. `center_hz` is the
+/// radio frequency of the samples' centre.
+pub fn classify_samples(samples: &[Complex<f32>], rate: f64, center_hz: f64, width_hz: f64) -> Option<Classification> {
+    let focus = (width_hz / 2.0 + 300.0).max(500.0);
+    let mut c = decide(&measure(samples, rate, focus)?, center_hz);
+    if matches!(c.mode, Mode::Usb | Mode::Lsb) {
+        let upper = c.mode == Mode::Usb;
+        let dial = c.frequency_hz - center_hz;
+        if let Some(delta) = ssb_pitch_offset(samples, rate, dial, upper) {
+            c.frequency_hz = (c.frequency_hz + if upper { delta } else { -delta }).round();
+            c.reasons.push(Reason::VoicePitch);
+            c.confidence = (c.confidence + 0.1).min(0.95);
+        }
+    }
+    Some(c)
+}
+
+/// Brings the signal at `hz` down to a rate suited to its width and collects
+/// `ANALYSIS_SECONDS` of it; None if the band moved away.
+fn collect(blocks: Receiver<Block>, hz: f64, width_hz: f64) -> Option<(Vec<Complex<f32>>, f64)> {
     // Analysis rate: room for the signal and some noise either side, at least 24 kHz.
     let target = (width_hz * 1.6).max(24e3);
     let started = Instant::now();
@@ -296,14 +434,10 @@ fn job(blocks: Receiver<Block>, hz: f64, width_hz: f64, lo_hz: f64, result: Sync
         let block = match blocks.recv_timeout(Duration::from_millis(500)) {
             Ok(b) => b,
             Err(RecvTimeoutError::Timeout) if started.elapsed() < Duration::from_secs(5) => continue,
-            _ => {
-                let _ = result.send(None);
-                return;
-            }
+            _ => return None,
         };
         if (hz - block.center_hz).abs() > block.sample_rate / 2.0 {
-            let _ = result.send(None);
-            return;
+            return None;
         }
         if chain.as_ref().is_none_or(|c| c.0 != block.center_hz || c.1 != block.sample_rate) {
             if chain.is_some() {
@@ -329,9 +463,7 @@ fn job(blocks: Receiver<Block>, hz: f64, width_hz: f64, lo_hz: f64, result: Sync
         }
         collected.extend_from_slice(&a);
         if collected.len() as f64 >= *rate * ANALYSIS_SECONDS {
-            let verdict = measure(&collected, *rate).map(|f| decide(&f, hz + lo_hz));
-            let _ = result.send(verdict);
-            return;
+            return Some((collected, *rate));
         }
     }
 }
@@ -356,10 +488,54 @@ mod tests {
         let n = (RATE * ANALYSIS_SECONDS) as usize;
         let samples: Vec<Complex<f32>> =
             noise(n, 0.01).into_iter().enumerate().map(|(i, w)| w + signal(i as f64 / RATE)).collect();
-        let f = measure(&samples, RATE).expect("features");
-        let c = decide(&f, center);
+        let f = measure(&samples, RATE, 1.8e3).expect("features");
+        let c = classify_samples(&samples, RATE, center, 3e3).expect("classification");
         println!("{f:?}\n→ {c:?}");
         c
+    }
+
+    /// Voiced speech in USB above `dial` (relative Hz): harmonics of a pitch that moves
+    /// like intonation, shaped by two formants.
+    fn voiced_usb(dial: f64) -> impl Fn(f64) -> Complex<f32> {
+        move |t: f64| {
+            // Phase of the fundamental: integral of f0(t) = 130 + 35 sin(2π·1.7t).
+            let phase0 = 2.0 * PI * (130.0 * t - 35.0 / (2.0 * PI * 1.7) * (2.0 * PI * 1.7 * t).cos());
+            let f0 = 130.0 + 35.0 * (2.0 * PI * 1.7 * t).sin();
+            (1..=20)
+                .map(|k| {
+                    let f = k as f64 * f0;
+                    let formant = 1.0 + 3.0 * (-((f - 600.0) / 250.0).powi(2)).exp() + 2.0 * (-((f - 1800.0) / 400.0).powi(2)).exp();
+                    let amp = if (200.0..2800.0).contains(&f) { 0.03 * formant / (k as f64).sqrt() } else { 0.0 };
+                    Complex::from_polar(amp as f32, (k as f64 * phase0 + 2.0 * PI * dial * t + k as f64) as f32)
+                })
+                .sum()
+        }
+    }
+
+    #[test]
+    fn voice_pitch_finds_the_ssb_carrier() {
+        let n = (RATE * ANALYSIS_SECONDS) as usize;
+        let signal = voiced_usb(0.0);
+        let samples: Vec<Complex<f32>> = noise(n, 0.005).into_iter().enumerate().map(|(i, w)| w + signal(i as f64 / RATE)).collect();
+        let _ = ssb_pitch_offset(&samples, RATE, 0.0, true);
+        for rough in [130.0, -90.0, 40.0] {
+            let delta = ssb_pitch_offset(&samples, RATE, rough, true).expect("pitch");
+            println!("rough {rough:+} → correction {delta:+}");
+            assert!((rough + delta).abs() <= 10.0, "rough {rough}, correction {delta}");
+        }
+        // LSB: the same voice mirrored below the carrier.
+        let mirrored: Vec<Complex<f32>> = samples.iter().map(|z| z.conj()).collect();
+        let delta = ssb_pitch_offset(&mirrored, RATE, -70.0, false).expect("pitch");
+        assert!((-70.0 - delta).abs() <= 10.0, "LSB correction {delta}");
+    }
+
+    #[test]
+    fn qo100_voice_is_tuned_to_its_carrier() {
+        // Carrier 400 Hz above the analysis centre (a click on the voice, not the carrier).
+        let c = classify(voiced_usb(-400.0), 10489.7604e6);
+        assert_eq!(c.mode, Mode::Usb);
+        assert!(c.reasons.contains(&Reason::VoicePitch), "{c:?}");
+        assert!((c.frequency_hz - 10489.760e6).abs() <= 15.0, "dial {}", c.frequency_hz);
     }
 
     /// Speech-like audio: tones from 300 Hz to 2.6 kHz, strongest at the low end.
@@ -475,6 +651,7 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::sync_channel(32);
             handle.commands.send(Command::Subscribe(10 + i as u32, tx)).unwrap();
             let result = spawn_job(rx, mhz * 1e6, 150e3, 0.0).recv().unwrap();
+            let _ = Reason::VoicePitch;
             println!("{mhz} MHz → {result:?}");
         }
     }
@@ -494,7 +671,7 @@ mod tests {
                 w + Complex::from_polar(0.3, phase as f32)
             })
             .collect();
-        let f = measure(&samples, rate).unwrap();
+        let f = measure(&samples, rate, 100e3).unwrap();
         let c = decide(&f, 100.3e6);
         println!("{f:?} → {c:?}");
         assert_eq!(c.mode, Mode::Wfm);
