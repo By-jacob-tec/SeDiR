@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use crate::audio::AudioBuffer;
 use crate::demod::{Chain, ChainConfig, Mode};
+use crate::rds::{RdsDecoder, RdsInfo};
 use crate::source::Block;
+use crate::stations::Stations;
 
 /// Audio kept queued for the sound card (seconds): enough to ride out scheduling jitter,
 /// short enough that tuning feels immediate.
@@ -40,11 +42,21 @@ pub struct ListenSettings {
 pub struct Listener {
     pub settings: Arc<Mutex<ListenSettings>>,
     level: Arc<AtomicU32>,
+    rds: Arc<Mutex<Option<RdsInfo>>>,
 }
 
 impl Listener {
     pub fn new(settings: ListenSettings) -> Self {
-        Self { settings: Arc::new(Mutex::new(settings)), level: Arc::new(AtomicU32::new((-150.0f32).to_bits())) }
+        Self {
+            settings: Arc::new(Mutex::new(settings)),
+            level: Arc::new(AtomicU32::new((-150.0f32).to_bits())),
+            rds: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// RDS of the station listened to (WFM), None in other modes.
+    pub fn rds(&self) -> Option<RdsInfo> {
+        self.rds.lock().unwrap().clone()
     }
 
     pub fn update(&self, f: impl FnOnce(&mut ListenSettings)) {
@@ -56,13 +68,11 @@ impl Listener {
         f32::from_bits(self.level.load(Ordering::Relaxed))
     }
 
-    /// Runs until the source stops (its block channel closes).
-    pub fn spawn(&self, blocks: Receiver<Block>, audio: AudioBuffer) {
-        let (settings, level) = (self.settings.clone(), self.level.clone());
-        thread::Builder::new()
-            .name("listen".into())
-            .spawn(move || run(blocks, settings, level, audio))
-            .expect("listen thread");
+    /// Runs until the source stops (its block channel closes). Station names read from
+    /// RDS go to `stations`.
+    pub fn spawn(&self, blocks: Receiver<Block>, audio: AudioBuffer, stations: Stations) {
+        let me = self.clone();
+        thread::Builder::new().name("listen".into()).spawn(move || run(blocks, me, audio, stations)).expect("listen thread");
     }
 }
 
@@ -95,7 +105,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(32);
         handle.commands.send(Command::Subscribe(1, tx)).unwrap();
         let audio = AudioBuffer::default();
-        listener.spawn(rx, audio.clone());
+        listener.spawn(rx, audio.clone(), Stations::new(false));
         // Stand-in for the sound card: take 48 000 samples per second.
         let started = Instant::now();
         let mut taken: Vec<f32> = Vec::new();
@@ -115,6 +125,7 @@ mod tests {
                 second = (usize::MAX, 0, 0);
             }
         }
+        println!("RDS: {:?}", listener.rds());
         for e in handle.events.try_iter() {
             if let crate::source::Event::Stats(s) = e {
                 println!("{s:?}");
@@ -149,8 +160,11 @@ mod tests {
     }
 }
 
-fn run(blocks: Receiver<Block>, settings: Arc<Mutex<ListenSettings>>, level: Arc<AtomicU32>, audio: AudioBuffer) {
+fn run(blocks: Receiver<Block>, me: Listener, audio: AudioBuffer, stations: Stations) {
+    let (settings, level) = (me.settings, me.level);
     let mut chain: Option<Chain> = None;
+    // Listening frequency the RDS decoder has been following.
+    let mut rds_frequency = f64::NAN;
     let mut out = Vec::new();
     loop {
         let block = match blocks.recv_timeout(Duration::from_millis(500)) {
@@ -166,6 +180,13 @@ fn run(blocks: Receiver<Block>, settings: Arc<Mutex<ListenSettings>>, level: Arc
             audio.set_prime((s.audio_rate * TARGET_DELAY) as usize);
         }
         let chain = chain.as_mut().expect("chain");
+        // Moved to another station: its RDS starts from scratch.
+        if (s.frequency_hz - rds_frequency).abs() >= crate::stations::SAME_STATION_HZ / 2.0 {
+            rds_frequency = s.frequency_hz;
+            if chain.rds.is_some() {
+                chain.rds = Some(RdsDecoder::new(chain.channel_rate()));
+            }
+        }
         let offset = s.frequency_hz - block.center_hz;
         if offset.abs() > block.sample_rate / 2.0 {
             // Listening outside the received band: nothing to hear.
@@ -185,5 +206,10 @@ fn run(blocks: Receiver<Block>, settings: Arc<Mutex<ListenSettings>>, level: Arc
         chain.process(&block.samples, offset, speed, s.squelch_db, &mut out);
         level.store(chain.level_db.to_bits(), Ordering::Relaxed);
         audio.push(&out);
+        let info = chain.rds.as_ref().map(|r| r.info().clone());
+        if let Some(name) = info.as_ref().and_then(|i| i.stable_ps.as_ref()) {
+            stations.record(s.frequency_hz, name);
+        }
+        *me.rds.lock().unwrap() = info;
     }
 }

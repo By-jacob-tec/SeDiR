@@ -119,6 +119,14 @@ pub struct Strings {
     pub mute: &'static str,
     pub refresh_audio: &'static str,
     pub audio_error: &'static str,
+    pub find_names: &'static str,
+    pub find_names_tooltip: &'static str,
+    pub rds_searching: &'static str,
+    pub clock: &'static str,
+    pub traffic_tooltip: &'static str,
+    pub af_tooltip: &'static str,
+    /// Programme type names (RDS, European table).
+    pub pty: [&'static str; 32],
 }
 
 pub static EN: Strings = Strings {
@@ -181,6 +189,18 @@ pub static EN: Strings = Strings {
     mute: "Mute",
     refresh_audio: "Refresh the list of sound devices",
     audio_error: "Sound: {}",
+    find_names: "Find station names (RDS)",
+    find_names_tooltip: "Reads the RDS name of the FM stations in view in the background and shows it on the spectrum.",
+    rds_searching: "looking for RDS…",
+    clock: "Time",
+    traffic_tooltip: "TP: the station carries traffic news · TA: traffic announcement on air",
+    af_tooltip: "Alternative frequencies of this station",
+    pty: [
+        "None", "News", "Current affairs", "Information", "Sport", "Education", "Drama", "Culture",
+        "Science", "Varied", "Pop music", "Rock music", "Easy listening", "Light classical", "Serious classical", "Other music",
+        "Weather", "Finance", "Children's programmes", "Social affairs", "Religion", "Phone-in", "Travel", "Leisure",
+        "Jazz music", "Country music", "National music", "Oldies music", "Folk music", "Documentary", "Alarm test", "Alarm",
+    ],
 };
 
 pub static TR: Strings = Strings {
@@ -243,6 +263,18 @@ pub static TR: Strings = Strings {
     mute: "Sessiz",
     refresh_audio: "Ses cihazı listesini yenile",
     audio_error: "Ses: {}",
+    find_names: "İstasyon adlarını bul (RDS)",
+    find_names_tooltip: "Görünen FM istasyonlarının RDS adını arka planda okur ve spektrumda gösterir.",
+    rds_searching: "RDS aranıyor…",
+    clock: "Saat",
+    traffic_tooltip: "TP: istasyon trafik bilgisi verir · TA: şu an trafik duyurusu var",
+    af_tooltip: "Bu istasyonun diğer frekansları",
+    pty: [
+        "Yok", "Haberler", "Güncel olaylar", "Bilgi", "Spor", "Eğitim", "Drama", "Kültür",
+        "Bilim", "Çeşitli", "Pop müzik", "Rock müzik", "Hafif müzik", "Hafif klasik", "Klasik müzik", "Diğer müzik",
+        "Hava durumu", "Ekonomi", "Çocuk programları", "Toplumsal konular", "Din", "Telefonla katılım", "Seyahat", "Boş zaman",
+        "Caz", "Country", "Ulusal müzik", "Eski şarkılar", "Halk müziği", "Belgesel", "Alarm testi", "Alarm",
+    ],
 };
 
 #[cfg(test)]

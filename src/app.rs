@@ -14,7 +14,9 @@ use sedir::device::{self, DeviceInfo, DeviceKind, FreqCheck, Limits};
 use sedir::freq;
 use sedir::listen::{ListenSettings, Listener};
 use sedir::radio::Tuning;
+use sedir::rds::RdsInfo;
 use sedir::source::{self, Command, Event, Frame, Handle, Stats, View};
+use sedir::stations::Stations;
 
 use crate::i18n::{Lang, Strings, fill};
 use crate::settings::Settings;
@@ -38,6 +40,13 @@ const MIN_SPAN: f64 = 5e3;
 const LISTEN_ID: u32 = 1;
 /// Blocks the listening thread may have queued (~0.6 s).
 const LISTEN_QUEUE: usize = 32;
+/// Subscriber id of the station name scanner.
+const SCAN_ID: u32 = 2;
+/// Signals at least this wide and this far above the noise, inside the FM broadcast
+/// bands (OIRT 65.8–74 MHz included), are searched for RDS.
+const FM_MIN_WIDTH_HZ: f64 = 50e3;
+const FM_MIN_SNR_DB: f32 = 12.0;
+const FM_BANDS_HZ: (f64, f64) = (64e6, 110e6);
 const LOGO_PIXELS: usize = 128;
 const DEFAULT_VOLUME: f32 = 60.0;
 
@@ -91,6 +100,9 @@ pub struct SedirApp {
     squelch_on: bool,
     squelch_db: f32,
     listener: Listener,
+    stations: Stations,
+    find_names: bool,
+    rds: Option<RdsInfo>,
 
     audio_buffer: AudioBuffer,
     volume: Volume,
@@ -113,7 +125,11 @@ impl SedirApp {
         let mode = settings.mode.as_deref().and_then(Mode::from_name).unwrap_or(Mode::Nfm);
         let volume_pct = settings.volume.unwrap_or(DEFAULT_VOLUME);
         let logo = ColorImage::from_rgba_unmultiplied([LOGO_PIXELS, LOGO_PIXELS], &crate::logo::rgba(LOGO_PIXELS, false));
+        let find_names = settings.find_names.unwrap_or(true);
         let mut app = Self {
+            stations: Stations::new(find_names),
+            find_names,
+            rds: None,
             mode,
             bandwidth_hz: mode.default_bandwidth(),
             squelch_on: false,
@@ -272,7 +288,10 @@ impl SedirApp {
         let (tx, rx) = mpsc::sync_channel(LISTEN_QUEUE);
         self.send(Command::Subscribe(LISTEN_ID, tx));
         self.sync_listener();
-        self.listener.spawn(rx, self.audio_buffer.clone());
+        self.listener.spawn(rx, self.audio_buffer.clone(), self.stations.clone());
+        let (tx, rx) = mpsc::sync_channel(LISTEN_QUEUE);
+        self.send(Command::Subscribe(SCAN_ID, tx));
+        self.stations.spawn_scanner(rx);
         if self.audio.is_none() {
             self.open_audio();
         }
@@ -503,6 +522,15 @@ impl SedirApp {
         if self.frames_since_scan >= SCAN_EVERY_FRAMES {
             self.frames_since_scan = 0;
             self.signals = detect::find(&self.smoothed, info.lo_hz, info.hi_hz, self.threshold_db);
+            // FM stations, strongest first, for the RDS name scanner.
+            let mut fm: Vec<&Signal> = self
+                .signals
+                .iter()
+                .filter(|s| s.bandwidth_hz >= FM_MIN_WIDTH_HZ && s.snr_db >= FM_MIN_SNR_DB)
+                .filter(|s| (FM_BANDS_HZ.0..=FM_BANDS_HZ.1).contains(&s.center_hz))
+                .collect();
+            fm.sort_by(|a, b| b.snr_db.total_cmp(&a.snr_db));
+            self.stations.set_targets(fm.iter().map(|s| s.center_hz).collect());
         }
     }
 
@@ -809,6 +837,11 @@ impl SedirApp {
                 self.settings.save();
             }
         });
+        if ui.checkbox(&mut self.find_names, t.find_names).on_hover_text(t.find_names_tooltip).changed() {
+            self.stations.set_enabled(self.find_names);
+            self.settings.find_names = Some(self.find_names);
+            self.settings.save();
+        }
         if let Some(f) = self.frame {
             ui.label(RichText::new(format!("{}: {}", t.resolution, freq::short(f.bin_hz.max(1.0)))).size(12.0).color(MUTED));
         }
@@ -846,7 +879,10 @@ impl SedirApp {
                     }
                     for s in &self.signals {
                         let selected = (self.vfo_hz - s.center_hz).abs() <= s.bandwidth_hz / 2.0;
-                        let text = format!("{}  ·  {}  ·  {:.0} dB", mhz_text(s.center_hz), freq::short(s.bandwidth_hz), s.snr_db);
+                        let mut text = format!("{}  ·  {}  ·  {:.0} dB", mhz_text(s.center_hz), freq::short(s.bandwidth_hz), s.snr_db);
+                        if let Some(name) = self.stations.name_near(s.center_hz) {
+                            text = format!("{name}  ·  {text}");
+                        }
                         let text = RichText::new(text).monospace().size(12.0);
                         let button = if selected {
                             egui::Button::new(text.color(DEEP).strong()).fill(AMBER)
@@ -948,6 +984,31 @@ impl SedirApp {
             painter.add(Shape::line(points, Stroke::new(1.3, SPECTRUM)));
         }
 
+        // Station names above their peaks, strongest first; a label that would overlap one
+        // already drawn moves up a row, or is left out.
+        let mut placed: Vec<Rect> = Vec::new();
+        let mut named: Vec<(&Signal, String)> =
+            self.signals.iter().filter_map(|s| self.stations.name_near(s.center_hz).map(|n| (s, n))).collect();
+        named.sort_by(|a, b| b.0.snr_db.total_cmp(&a.0.snr_db));
+        for (s, name) in named {
+            let x = x_of(s.center_hz);
+            if !(full.left()..=full.right()).contains(&x) {
+                continue;
+            }
+            let galley = painter.layout_no_wrap(name, FontId::proportional(12.0), DEEP);
+            let size = galley.size() + vec2(10.0, 4.0);
+            let peak_y = y_of(s.peak_db).clamp(spec_rect.top() + 40.0, spec_rect.bottom());
+            let spot = (0..3).map(|row| {
+                let bottom = peak_y - 6.0 - row as f32 * (size.y + 3.0);
+                Rect::from_min_size(pos2((x - size.x / 2.0).clamp(full.left() + 2.0, full.right() - size.x - 2.0), bottom - size.y), size)
+            });
+            if let Some(r) = spot.into_iter().find(|r| r.top() >= spec_rect.top() + 30.0 && !placed.iter().any(|p| p.expand(2.0).intersects(*r))) {
+                painter.rect_filled(r, CornerRadius::same(4), AMBER.gamma_multiply(0.9));
+                painter.galley(r.min + vec2(5.0, 2.0), galley, DEEP);
+                placed.push(r);
+            }
+        }
+
         // Band the demodulator hears.
         let (plo, phi) = self.mode.passband(self.bandwidth_hz);
         let (ax, bx) = (x_of(self.vfo_hz + plo), x_of(self.vfo_hz + phi).max(x_of(self.vfo_hz + plo) + 2.0));
@@ -1024,6 +1085,45 @@ impl SedirApp {
         }
     }
 
+    /// RDS of the station listened to: name, programme type, traffic flags, clock, radio text.
+    fn rds_bar(&self, ui: &mut egui::Ui) {
+        let t = self.t();
+        ui.horizontal(|ui| {
+            let synced = self.rds.as_ref().is_some_and(|r| r.synced);
+            let badge = egui::Button::new(RichText::new("RDS").size(11.0).strong().color(DEEP))
+                .fill(if synced { ACCENT } else { MUTED })
+                .corner_radius(4)
+                .sense(Sense::hover());
+            ui.add(badge);
+            let Some(r) = self.rds.as_ref().filter(|r| r.pi.is_some()) else {
+                ui.label(RichText::new(t.rds_searching).size(12.0).color(MUTED));
+                return;
+            };
+            ui.label(RichText::new(r.ps.trim()).size(20.0).monospace().strong().color(AMBER));
+            if let Some(pi) = r.pi {
+                ui.label(RichText::new(format!("PI {pi:04X}")).size(12.0).monospace().color(MUTED));
+            }
+            if let Some(pty) = r.pty.filter(|&p| p > 0) {
+                ui.label(RichText::new(t.pty[pty as usize & 31]).size(13.0).color(TEXT));
+            }
+            let flag = |ui: &mut egui::Ui, on: bool, text: &str| {
+                ui.label(RichText::new(text).size(11.0).strong().monospace().color(if on { WARN } else { MUTED.gamma_multiply(0.6) }))
+                    .on_hover_text(t.traffic_tooltip);
+            };
+            flag(ui, r.tp, "TP");
+            flag(ui, r.ta, "TA");
+            if let Some(c) = r.clock {
+                ui.label(RichText::new(format!("{} {}", t.clock, c.local_hm())).size(12.0).monospace().color(TEXT));
+            }
+            if !r.af.is_empty() {
+                let list = r.af.iter().map(|f| format!("{:.1}", f / 1e6)).collect::<Vec<_>>().join("  ");
+                ui.label(RichText::new(format!("AF {}", r.af.len())).size(12.0).monospace().color(MUTED)).on_hover_text(format!("{}\n{list}", t.af_tooltip));
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new(&r.radio_text).size(14.0).color(TEXT));
+        });
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
         let t = self.t();
         ui.horizontal(|ui| {
@@ -1075,6 +1175,12 @@ impl eframe::App for SedirApp {
         egui::Panel::bottom("status")
             .frame(egui::Frame::new().fill(DEEP).inner_margin(egui::Margin::symmetric(12, 4)))
             .show(ui, |ui| self.status_bar(ui));
+        self.rds = if self.mode == Mode::Wfm && self.opened { self.listener.rds() } else { None };
+        if self.mode == Mode::Wfm && self.opened {
+            egui::Panel::bottom("rds")
+                .frame(egui::Frame::new().fill(CARD).inner_margin(egui::Margin::symmetric(14, 6)))
+                .show(ui, |ui| self.rds_bar(ui));
+        }
         egui::Panel::left("sidebar")
             .resizable(true)
             .default_size(310.0)

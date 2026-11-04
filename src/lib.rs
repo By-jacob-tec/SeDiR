@@ -10,4 +10,6 @@ pub mod freq;
 pub mod iio;
 pub mod listen;
 pub mod radio;
+pub mod rds;
 pub mod source;
+pub mod stations;

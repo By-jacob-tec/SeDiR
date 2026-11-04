@@ -74,7 +74,7 @@ impl<T: Sample> FirDecimator<T> {
 }
 
 /// Decimate-by-2 half-band filter: passes up to ~0.26 of the output rate cleanly.
-fn halfband<T: Sample>() -> FirDecimator<T> {
+pub fn halfband<T: Sample>() -> FirDecimator<T> {
     FirDecimator::new(&lowpass(0.25, 23), 2)
 }
 
@@ -257,6 +257,55 @@ impl Resampler {
     }
 }
 
+/// A broadcast FM station brought down to its multiplex signal (mono audio, 19 kHz pilot,
+/// stereo difference and the 57 kHz RDS subcarrier), without audio processing. Used to
+/// read RDS from stations that are not being listened to.
+pub struct MpxChannel {
+    mixer: Mixer,
+    halfbands: Vec<FirDecimator<Complex<f32>>>,
+    channel: FirDecimator<Complex<f32>>,
+    pub rate: f64,
+    last: Complex<f32>,
+    a: Vec<Complex<f32>>,
+    b: Vec<Complex<f32>>,
+}
+
+impl MpxChannel {
+    pub fn new(input_rate: f64) -> Self {
+        let mut rate = input_rate;
+        let mut halfbands = Vec::new();
+        while rate / 2.0 >= Mode::Wfm.channel_rate() {
+            halfbands.push(halfband());
+            rate /= 2.0;
+        }
+        let channel = FirDecimator::new(&lowpass(100e3 / rate, taps_for(rate, 40e3, 401)), 1);
+        Self { mixer: Mixer::new(0.0, input_rate), halfbands, channel, rate, last: Complex::default(), a: Vec::new(), b: Vec::new() }
+    }
+
+    /// Appends the multiplex signal (1.0 = 75 kHz deviation) of the station `offset_hz`
+    /// from the band centre.
+    pub fn process(&mut self, input: &[Complex<f32>], offset_hz: f64, out: &mut Vec<f32>) {
+        self.mixer.set(-offset_hz);
+        let (mut a, mut b) = (std::mem::take(&mut self.a), std::mem::take(&mut self.b));
+        a.clear();
+        a.extend_from_slice(input);
+        self.mixer.mix(&mut a);
+        for hb in &mut self.halfbands {
+            b.clear();
+            hb.process(&a, &mut b);
+            std::mem::swap(&mut a, &mut b);
+        }
+        b.clear();
+        self.channel.process(&a, &mut b);
+        let scale = self.rate as f32 / (2.0 * std::f32::consts::PI * 75e3);
+        for &z in &b {
+            out.push((z * self.last.conj()).arg() * scale);
+            self.last = z;
+        }
+        (self.a, self.b) = (a, b);
+    }
+}
+
 /// Settings a chain is built for; any change rebuilds it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChainConfig {
@@ -285,6 +334,9 @@ pub struct Chain {
     resampler: Resampler,
     /// Mean channel power of the last call (dBFS).
     pub level_db: f32,
+    /// RDS of the station listened to (WFM only).
+    pub rds: Option<crate::rds::RdsDecoder>,
+    mpx: Vec<f32>,
     scratch: Vec<Complex<f32>>,
     scratch2: Vec<Complex<f32>>,
 }
@@ -348,9 +400,16 @@ impl Chain {
             audio_in_rate: audio_rate_in,
             resampler: Resampler { pos: 0.0, prev: 0.0 },
             level_db: -150.0,
+            rds: (mode == Mode::Wfm).then(|| crate::rds::RdsDecoder::new(rate)),
+            mpx: Vec::new(),
             scratch: Vec::new(),
             scratch2: Vec::new(),
         }
+    }
+
+    /// Sample rate of the channel filter and demodulator.
+    pub fn channel_rate(&self) -> f64 {
+        self.channel_rate
     }
 
     /// Demodulates `input` (at the configured input rate), listening `offset_hz` from the
@@ -385,9 +444,13 @@ impl Chain {
             Mode::Wfm | Mode::Nfm => {
                 let deviation = if mode == Mode::Wfm { 75e3 } else { (self.config.bandwidth * 0.2) as f32 };
                 let scale = rate / (2.0 * std::f32::consts::PI * deviation);
+                self.mpx.clear();
                 for &z in channel.iter() {
                     let d = (z * self.last.conj()).arg() * scale;
                     self.last = z;
+                    if self.rds.is_some() {
+                        self.mpx.push(d);
+                    }
                     let v = match &mut self.deemphasis {
                         Some((alpha, state)) => {
                             *state += *alpha * (d - *state);
@@ -396,6 +459,9 @@ impl Chain {
                         None => d,
                     };
                     audio.push(v * 0.5);
+                }
+                if let Some(rds) = &mut self.rds {
+                    rds.process(&self.mpx);
                 }
             }
             Mode::Am => {

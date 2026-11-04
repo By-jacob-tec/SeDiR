@@ -19,6 +19,8 @@ pub struct Settings {
     pub audio_device: Option<String>,
     /// Volume in percent.
     pub volume: Option<f32>,
+    /// Whether station names are read from RDS in the background.
+    pub find_names: Option<bool>,
 }
 
 fn path() -> Option<PathBuf> {
@@ -47,6 +49,7 @@ impl Settings {
                 "mode" if !value.is_empty() => s.mode = Some(value.to_string()),
                 "audio_device" if !value.is_empty() => s.audio_device = Some(value.to_string()),
                 "volume" => s.volume = value.parse().ok(),
+                "find_names" => s.find_names = value.parse().ok(),
                 _ => {}
             }
         }
@@ -78,6 +81,9 @@ impl Settings {
         }
         if let Some(v) = self.volume {
             out += &format!("volume={v}\n");
+        }
+        if let Some(f) = self.find_names {
+            out += &format!("find_names={f}\n");
         }
         out
     }
@@ -112,6 +118,7 @@ mod tests {
             mode: Some("NFM".into()),
             audio_device: Some("wasapi:{0.0.0.00000000}.{abc}".into()),
             volume: Some(70.0),
+            find_names: Some(false),
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
     }
