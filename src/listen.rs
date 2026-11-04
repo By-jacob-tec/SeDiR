@@ -47,12 +47,22 @@ pub struct CwInfo {
     pub signal: bool,
 }
 
+/// Text decoded from an RTTY or PSK31 signal.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DataInfo {
+    pub text: String,
+    /// What the decoder found (shift, speed, offset…).
+    pub detail: String,
+    pub signal: bool,
+}
+
 #[derive(Clone)]
 pub struct Listener {
     pub settings: Arc<Mutex<ListenSettings>>,
     level: Arc<AtomicU32>,
     rds: Arc<Mutex<Option<RdsInfo>>>,
     cw: Arc<Mutex<Option<CwInfo>>>,
+    data: Arc<Mutex<Option<DataInfo>>>,
 }
 
 impl Listener {
@@ -62,7 +72,13 @@ impl Listener {
             level: Arc::new(AtomicU32::new((-150.0f32).to_bits())),
             rds: Arc::new(Mutex::new(None)),
             cw: Arc::new(Mutex::new(None)),
+            data: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Text decoded from the RTTY/PSK31 signal listened to, None in other modes.
+    pub fn data(&self) -> Option<DataInfo> {
+        self.data.lock().unwrap().clone()
     }
 
     /// Text decoded from the CW signal listened to, None in other modes.
@@ -205,6 +221,9 @@ fn run(blocks: Receiver<Block>, me: Listener, audio: AudioBuffer, stations: Stat
             if chain.cw.is_some() {
                 chain.cw = Some(crate::cw::CwDecoder::new(chain.channel_rate()));
             }
+            if chain.text.is_some() {
+                chain.text = crate::demod::text_decoder(s.mode, chain.channel_rate(), s.bandwidth_hz);
+            }
         }
         let offset = s.frequency_hz - block.center_hz;
         if offset.abs() > block.sample_rate / 2.0 {
@@ -232,5 +251,7 @@ fn run(blocks: Receiver<Block>, me: Listener, audio: AudioBuffer, stations: Stat
         *me.rds.lock().unwrap() = info;
         *me.cw.lock().unwrap() =
             chain.cw.as_ref().map(|d| CwInfo { text: d.text().to_string(), wpm: d.wpm(), key_down: d.key_down(), signal: d.signal });
+        *me.data.lock().unwrap() =
+            chain.text.as_ref().map(|d| DataInfo { text: d.text().to_string(), detail: d.detail(), signal: d.signal() });
     }
 }

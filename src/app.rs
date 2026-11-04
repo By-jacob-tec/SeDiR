@@ -1550,6 +1550,30 @@ impl SedirApp {
         });
     }
 
+    /// Text decoded from the RTTY or PSK31 signal listened to.
+    fn data_bar(&self, ui: &mut egui::Ui) {
+        let t = self.t();
+        let info = self.listener.data().unwrap_or_default();
+        ui.horizontal(|ui| {
+            let badge = egui::Button::new(RichText::new(self.mode.name()).size(11.0).strong().color(DEEP))
+                .fill(if info.signal { ACCENT } else { MUTED })
+                .corner_radius(4)
+                .sense(Sense::hover());
+            ui.add(badge).on_hover_text(if self.mode == Mode::Rtty { t.rtty_tooltip } else { t.psk_tooltip });
+            if !info.detail.is_empty() {
+                ui.label(RichText::new(&info.detail).size(12.0).monospace().color(MUTED));
+            }
+            if info.text.is_empty() {
+                ui.label(RichText::new(t.data_waiting).size(12.0).color(MUTED));
+            } else {
+                let width = ui.available_width();
+                let chars = (width / 9.5) as usize;
+                let shown: String = info.text.chars().rev().take(chars).collect::<Vec<_>>().into_iter().rev().collect();
+                ui.label(RichText::new(shown).size(16.0).monospace().color(TEXT));
+            }
+        });
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
         let t = self.t();
         ui.horizontal(|ui| {
@@ -1628,6 +1652,12 @@ impl eframe::App for SedirApp {
             egui::Panel::bottom("cw")
                 .frame(egui::Frame::new().fill(CARD).inner_margin(egui::Margin::symmetric(14, 6)))
                 .show(ui, |ui| self.cw_bar(ui));
+        }
+        if self.mode.is_data() && self.opened {
+            egui::Panel::bottom("data")
+                .frame(egui::Frame::new().fill(CARD).inner_margin(egui::Margin::symmetric(14, 6)))
+                .show(ui, |ui| self.data_bar(ui));
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
         }
         egui::Panel::left("sidebar")
             .resizable(true)

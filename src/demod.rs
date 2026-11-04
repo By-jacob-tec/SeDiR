@@ -129,15 +129,39 @@ pub enum Mode {
     Usb,
     Lsb,
     Cw,
+    Rtty,
+    Psk,
 }
 
 /// Pitch of a CW signal tuned exactly (Hz).
 pub const CW_TONE: f64 = 700.0;
+/// Audio frequency an RTTY or PSK31 signal's centre is heard at (Hz).
+pub const DATA_TONE: f64 = 1000.0;
+
+/// Turns a listened channel (complex baseband at the channel rate, centred on the
+/// listening frequency) into text.
+pub trait TextDecoder: Send {
+    fn push(&mut self, channel: &[Complex<f32>]);
+    fn text(&self) -> &str;
+    /// Short description of what was found (speed, shift, offset…).
+    fn detail(&self) -> String;
+    /// Whether a usable signal is present.
+    fn signal(&self) -> bool;
+}
+
+/// Text decoder for the data modes (RTTY, PSK31).
+pub fn text_decoder(mode: Mode, channel_rate: f64, bandwidth: f64) -> Option<Box<dyn TextDecoder>> {
+    match mode {
+        Mode::Rtty => Some(Box::new(crate::rtty::RttyDecoder::new(channel_rate, bandwidth / 2.0))),
+        Mode::Psk => Some(Box::new(crate::psk::PskDecoder::new(channel_rate, bandwidth / 2.0))),
+        _ => None,
+    }
+}
 /// Lowest audio frequency passed in SSB (Hz).
 const SSB_LOW: f64 = 300.0;
 
 impl Mode {
-    pub const ALL: [Mode; 6] = [Mode::Am, Mode::Nfm, Mode::Wfm, Mode::Usb, Mode::Lsb, Mode::Cw];
+    pub const ALL: [Mode; 8] = [Mode::Am, Mode::Nfm, Mode::Wfm, Mode::Usb, Mode::Lsb, Mode::Cw, Mode::Rtty, Mode::Psk];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -147,6 +171,8 @@ impl Mode {
             Mode::Usb => "USB",
             Mode::Lsb => "LSB",
             Mode::Cw => "CW",
+            Mode::Rtty => "RTTY",
+            Mode::Psk => "PSK31",
         }
     }
 
@@ -161,8 +187,13 @@ impl Mode {
             Mode::Wfm => 480e3,
             Mode::Nfm => 64e3,
             Mode::Am => 32e3,
-            Mode::Usb | Mode::Lsb | Mode::Cw => 16e3,
+            Mode::Usb | Mode::Lsb | Mode::Cw | Mode::Rtty | Mode::Psk => 16e3,
         }
+    }
+
+    /// Whether the mode is decoded to text in the listening chain.
+    pub fn is_data(self) -> bool {
+        matches!(self, Mode::Rtty | Mode::Psk)
     }
 
     /// Default filter width (Hz).
@@ -173,6 +204,8 @@ impl Mode {
             Mode::Am => 9e3,
             Mode::Usb | Mode::Lsb => 2.4e3,
             Mode::Cw => 500.0,
+            Mode::Rtty => 500.0,
+            Mode::Psk => 200.0,
         }
     }
 
@@ -183,6 +216,8 @@ impl Mode {
             Mode::Am => (2e3, 12e3),
             Mode::Usb | Mode::Lsb => (1e3, 3.6e3),
             Mode::Cw => (100.0, 1.5e3),
+            Mode::Rtty => (300.0, 1.5e3),
+            Mode::Psk => (100.0, 800.0),
         }
     }
 
@@ -193,7 +228,7 @@ impl Mode {
             Mode::Nfm => 12.5e3,
             Mode::Am => 5e3,
             // Fine enough to correct an SSB voice's pitch by ear (Shift gives 100 Hz).
-            Mode::Usb | Mode::Lsb | Mode::Cw => 10.0,
+            Mode::Usb | Mode::Lsb | Mode::Cw | Mode::Rtty | Mode::Psk => 10.0,
         }
     }
 
@@ -215,7 +250,7 @@ impl Mode {
             Mode::Wfm => 50e3,
             Mode::Nfm => 6.25e3,
             Mode::Am => 1e3,
-            Mode::Usb | Mode::Lsb | Mode::Cw => 1.0,
+            Mode::Usb | Mode::Lsb | Mode::Cw | Mode::Rtty | Mode::Psk => 1.0,
         };
         (hz / raster).round() * raster
     }
@@ -223,7 +258,8 @@ impl Mode {
     /// Whether a click on a found signal should tune to its centre (carrier-less modes
     /// are tuned to the edge, which the spectrum cannot tell exactly).
     pub fn snaps_to_center(self) -> bool {
-        matches!(self, Mode::Am | Mode::Nfm | Mode::Wfm)
+        // RTTY and PSK31 are tuned to their centre; their decoders find the exact place.
+        matches!(self, Mode::Am | Mode::Nfm | Mode::Wfm | Mode::Rtty | Mode::Psk)
     }
 }
 
@@ -352,6 +388,8 @@ pub struct Chain {
     pub rds: Option<crate::rds::RdsDecoder>,
     /// Morse to text (CW only).
     pub cw: Option<crate::cw::CwDecoder>,
+    /// RTTY or PSK31 to text.
+    pub text: Option<Box<dyn TextDecoder>>,
     mpx: Vec<f32>,
     scratch: Vec<Complex<f32>>,
     scratch2: Vec<Complex<f32>>,
@@ -369,8 +407,12 @@ impl Chain {
         let (lo, hi) = mode.passband(bandwidth);
         let center = (lo + hi) / 2.0;
         let half = (hi - lo) / 2.0;
-        let side_shift = matches!(mode, Mode::Usb | Mode::Lsb | Mode::Cw).then(|| {
-            let back = if mode == Mode::Cw { CW_TONE } else { center };
+        let side_shift = matches!(mode, Mode::Usb | Mode::Lsb | Mode::Cw | Mode::Rtty | Mode::Psk).then(|| {
+            let back = match mode {
+                Mode::Cw => CW_TONE,
+                Mode::Rtty | Mode::Psk => DATA_TONE,
+                _ => center,
+            };
             (Mixer::new(-center, rate), Mixer::new(back, rate))
         });
         // WFM gets a wide transition: its filter runs at the highest rate.
@@ -399,7 +441,7 @@ impl Chain {
             Mode::Wfm => Some(((1.0 - (-1.0 / (rate * 50e-6)).exp()) as f32, 0.0)),
             _ => None,
         };
-        let agc = matches!(mode, Mode::Am | Mode::Usb | Mode::Lsb | Mode::Cw).then(|| Agc::new(audio_rate_in));
+        let agc = matches!(mode, Mode::Am | Mode::Usb | Mode::Lsb | Mode::Cw | Mode::Rtty | Mode::Psk).then(|| Agc::new(audio_rate_in));
         Self {
             config,
             mixer: Mixer::new(0.0, input_rate),
@@ -418,6 +460,7 @@ impl Chain {
             level_db: -150.0,
             rds: (mode == Mode::Wfm).then(|| crate::rds::RdsDecoder::new(rate)),
             cw: (mode == Mode::Cw).then(|| crate::cw::CwDecoder::new(rate)),
+            text: text_decoder(mode, rate, bandwidth),
             mpx: Vec::new(),
             scratch: Vec::new(),
             scratch2: Vec::new(),
@@ -455,6 +498,9 @@ impl Chain {
         if let Some(cw) = &mut self.cw {
             cw.push(channel);
         }
+        if let Some(text) = &mut self.text {
+            text.push(channel);
+        }
         let power = channel.iter().map(|z| z.norm_sqr()).sum::<f32>() / channel.len().max(1) as f32;
         self.level_db = 10.0 * (power + 1e-20).log10();
 
@@ -491,7 +537,7 @@ impl Chain {
                     audio.push(env - self.dc);
                 }
             }
-            Mode::Usb | Mode::Lsb | Mode::Cw => {
+            Mode::Usb | Mode::Lsb | Mode::Cw | Mode::Rtty | Mode::Psk => {
                 let (_, up) = self.side_shift.as_mut().expect("side shift");
                 for &z in channel.iter() {
                     audio.push((z * up.next()).re);
