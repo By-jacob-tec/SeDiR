@@ -29,12 +29,29 @@ fn lookup(code: &str) -> char {
     MORSE.iter().find(|(c, _)| *c == code).map_or('*', |&(_, ch)| ch)
 }
 
+/// Envelope steps over which the signal and noise levels are measured (2 s).
+const LEVEL_WINDOW: usize = 2000;
+/// The levels are recomputed every this many steps.
+const LEVEL_EVERY: usize = 25;
+/// Envelope steps needed before the first levels (0.1 s).
+const LEVEL_FIRST: usize = 100;
+/// Signal over noise (amplitude ratio of the 95th to the 20th percentile) needed to
+/// decode: noise alone gives about 3, a readable CW signal far more.
+const MIN_RATIO: f32 = 5.0;
+/// Without a signal this long (ms), the speed estimate starts over.
+const RESET_AFTER_MS: f64 = 1500.0;
+
 pub struct CwDecoder {
     /// Input samples per envelope step.
     per_step: usize,
     count: usize,
     smooth: f32,
     alpha: f32,
+    /// Recent envelope values (ring) for the level percentiles.
+    history: Vec<f32>,
+    position: usize,
+    since_levels: usize,
+    silent_ms: f64,
     high: f32,
     low: f32,
     key: bool,
@@ -58,8 +75,12 @@ impl CwDecoder {
             smooth: 0.0,
             // ~2 ms envelope smoothing.
             alpha: (1.0 - (-1.0 / (rate * 0.002)).exp()) as f32,
+            history: Vec::with_capacity(LEVEL_WINDOW),
+            position: 0,
+            since_levels: 0,
+            silent_ms: 0.0,
             high: 0.0,
-            low: f32::MAX,
+            low: 0.0,
             key: false,
             run_ms: 0.0,
             dot_ms: 60.0,
@@ -96,21 +117,34 @@ impl CwDecoder {
     }
 
     fn step(&mut self, v: f32) {
-        // Signal level: up quickly, down slowly; noise level: down quickly, up slowly.
-        if self.low == f32::MAX {
-            self.low = v;
-        }
-        if v > self.high {
-            self.high += (v - self.high) * 0.2;
+        // Levels from the last 2 s: the 20th percentile is the noise (the key is up at
+        // least that share of the time), the 95th the keyed carrier.
+        if self.history.len() < LEVEL_WINDOW {
+            self.history.push(v);
         } else {
-            self.high += (v - self.high) * 0.0005;
+            self.history[self.position] = v;
+            self.position = (self.position + 1) % LEVEL_WINDOW;
         }
-        if v < self.low {
-            self.low += (v - self.low) * 0.2;
+        self.since_levels += 1;
+        if self.since_levels >= LEVEL_EVERY && self.history.len() >= LEVEL_FIRST {
+            self.since_levels = 0;
+            let mut sorted = self.history.clone();
+            sorted.sort_by(f32::total_cmp);
+            self.low = sorted[sorted.len() / 5];
+            self.high = sorted[sorted.len() * 95 / 100];
+            // Hysteresis: a signal must clearly appear, and clearly fade, to switch.
+            let ratio = self.high / self.low.max(1e-12);
+            self.signal = if self.signal { ratio > MIN_RATIO * 0.7 } else { ratio > MIN_RATIO };
+        }
+        if self.signal {
+            self.silent_ms = 0.0;
         } else {
-            self.low += (v - self.low) * 0.001;
+            self.silent_ms += STEP_MS;
+            if self.silent_ms > RESET_AFTER_MS {
+                self.dot_ms = 60.0;
+                self.symbol.clear();
+            }
         }
-        self.signal = self.high > self.low * 3.0;
         let span = self.high - self.low;
         let on = if self.key { v > self.low + 0.35 * span } else { v > self.low + 0.55 * span };
         let on = on && self.signal;
@@ -144,8 +178,8 @@ impl CwDecoder {
     }
 
     fn mark(&mut self, length: f64) {
-        // Shorter than a third of a dot: a noise spike.
-        if length < self.dot_ms * 0.3 {
+        // Shorter than a third of a dot, or than any hand or keyer sends: a noise spike.
+        if length < self.dot_ms * 0.3 || length < 12.0 {
             return;
         }
         if length < 2.0 * self.dot_ms {
@@ -218,12 +252,14 @@ mod tests {
             (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
         };
         let n = (keys.len() as f64 * dot * rate) as usize;
+        // Noise through a ~500 Hz channel (moving average), as the CW filter passes it.
+        let white: Vec<Complex<f32>> = (0..n + 32).map(|_| Complex::new(rnd(), rnd()) * noise).collect();
         let samples: Vec<Complex<f32>> = (0..n)
             .map(|i| {
                 let t = i as f64 / rate;
                 let on = keys[((t / dot) as usize).min(keys.len() - 1)];
                 let tone = if on { Complex::from_polar(0.2, (2.0 * PI * 30.0 * t) as f32) } else { Complex::default() };
-                tone + Complex::new(rnd(), rnd()) * noise
+                tone + white[i..i + 32].iter().sum::<Complex<f32>>() / 32.0 * 5.6
             })
             .collect();
         let mut d = CwDecoder::new(rate);
@@ -240,6 +276,33 @@ mod tests {
             let text = decode("CQ CQ DE TA4SO TA4SO K", wpm, 0.03);
             assert!(text.contains("DE TA4SO TA4SO K"), "{wpm} wpm: {text:?}");
         }
+    }
+
+    #[test]
+    fn noise_alone_gives_no_text() {
+        let rate = 16_000.0;
+        let mut seed = 11u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        // Noise through a ~500 Hz channel (moving average), as the CW filter passes it.
+        let white: Vec<Complex<f32>> = (0..(rate * 8.0) as usize).map(|_| Complex::new(rnd(), rnd()) * 0.1).collect();
+        let samples: Vec<Complex<f32>> = white.windows(32).map(|w| w.iter().sum::<Complex<f32>>() / 32.0).collect();
+        let mut d = CwDecoder::new(rate);
+        for chunk in samples.chunks(4000) {
+            d.push(chunk);
+        }
+        println!("noise → {:?}", d.text());
+        assert!(d.text().trim().len() <= 2, "{:?}", d.text());
+    }
+
+    #[test]
+    fn weak_signal_still_decodes() {
+        // Peak signal about 4.5 times the noise's rms in the channel (~13 dB).
+        let text = decode("TEST DE TA4SO K", 18.0, 0.15);
+        // A letter may be lost at this level; the call sign should come through.
+        assert!(text.contains("TA4SO K"), "{text:?}");
     }
 
     #[test]

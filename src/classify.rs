@@ -195,6 +195,10 @@ pub fn decide(f: &Features, center_hz: f64) -> Classification {
     let one_sided = f.balance > 4.0 || f.balance < 0.25;
     let mut reasons = Vec::new();
     let pick = |mode: Mode| (mode, hint == Some(mode));
+    // Switched on and off: CW keying (AM and FM transmitters stay on while they speak).
+    let keyed = f.off_fraction > 0.1 && f.off_fraction < 0.9;
+    // AM is expected only where the band plan has it, or where it says nothing.
+    let am_plausible = matches!(hint, None | Some(Mode::Am));
 
     // Broadcast FM is narrow during quiet passages; its outer width and the band plan
     // still give it away.
@@ -208,10 +212,17 @@ pub fn decide(f: &Features, center_hz: f64) -> Classification {
         let center = abs((f.lo_hz + f.hi_hz) / 2.0);
         let bw = if mode == Mode::Wfm { 180e3 } else { 25e3 };
         (mode, if constant_envelope { 0.9 } else { 0.7 }, mode.round_to_channel(center), bw)
-    } else if width < 400.0 || (f.carrier_fraction > 0.75 && width < 1.5e3) {
+    } else if width < 400.0
+        || (f.carrier_fraction > 0.75 && width < 1.5e3)
+        // A keyed carrier is CW, whatever the converter's phase noise spreads around it
+        // (on QO-100 that looked like AM sidebands).
+        || (keyed && f.carrier_fraction > 0.3 && width < 6e3)
+        // A carrier-dominated signal where AM is not used (amateur SSB/CW segments,
+        // QO-100) is CW or an unmodulated carrier, not AM.
+        || (f.carrier_fraction > 0.8 && !am_plausible && width < 6e3)
+    {
         // A bare carrier: CW, or an AM/FM transmitter without modulation.
         reasons.push(Reason::NarrowCarrier);
-        let keyed = f.off_fraction > 0.1 && f.off_fraction < 0.9;
         if keyed {
             reasons.push(Reason::Keyed);
         }
@@ -224,7 +235,7 @@ pub fn decide(f: &Features, center_hz: f64) -> Classification {
         }
         let frequency = mode.round_to_channel(abs(f.peak_hz));
         (mode, if keyed || by_plan { 0.85 } else { 0.6 }, frequency, mode.default_bandwidth())
-    } else if (f.carrier_fraction > 0.5 || (f.carrier_fraction > 0.2 && !constant_envelope)) && !one_sided {
+    } else if am_plausible && (f.carrier_fraction > 0.5 || (f.carrier_fraction > 0.2 && !constant_envelope)) && !one_sided {
         // A modulated FM signal rarely keeps half its power in one line; AM always does
         // (the carrier carries at least two thirds of it).
         reasons.push(Reason::CarrierAndSidebands);
@@ -654,6 +665,34 @@ mod tests {
             let _ = Reason::VoicePitch;
             println!("{mhz} MHz → {result:?}");
         }
+    }
+
+    #[test]
+    fn keyed_cw_with_phase_noise_on_qo100_is_cw() {
+        // A converter's phase noise spreads the carrier into skirts that looked like AM
+        // sidebands; the keying and the band plan settle it.
+        let mut phase = 0.0f64;
+        let mut seed = 5u32;
+        let mut jitter = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 8) as f64 / (1u64 << 24) as f64 - 0.5) * 0.12
+        };
+        let n = (RATE * ANALYSIS_SECONDS) as usize;
+        let carrier: Vec<f64> = (0..n)
+            .map(|_| {
+                phase += 2.0 * PI * 300.0 / RATE + jitter();
+                phase
+            })
+            .collect();
+        let c = classify(
+            |t| {
+                let i = ((t * RATE) as usize).min(n - 1);
+                let on = ((t * 8.0) as u32) % 3 != 2;
+                if on { Complex::from_polar(0.3, carrier[i] as f32) } else { Complex::default() }
+            },
+            10489.6e6,
+        );
+        assert_eq!(c.mode, Mode::Cw, "{c:?}");
     }
 
     #[test]
