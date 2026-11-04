@@ -79,8 +79,13 @@ pub struct SedirApp {
     error: Option<String>,
     stats: Stats,
 
+    /// Receiver centre and listening frequency, as radio frequencies (before the converter).
     center_hz: f64,
     vfo_hz: f64,
+    /// Local oscillator of a converter in front of the receiver (LNB, up-converter):
+    /// radio frequency = receiver frequency + this. 0 without one; negative for an
+    /// up-converter.
+    lo_hz: f64,
     sample_rate: f64,
     gain_db: f64,
     auto_gain: bool,
@@ -134,6 +139,7 @@ impl SedirApp {
         let volume_pct = settings.volume.unwrap_or(DEFAULT_VOLUME);
         let logo = ColorImage::from_rgba_unmultiplied([LOGO_PIXELS, LOGO_PIXELS], &crate::logo::rgba(LOGO_PIXELS, false));
         let find_names = settings.find_names.unwrap_or(true);
+        let lo_hz = settings.lo_hz.unwrap_or(0.0);
         let mut app = Self {
             auto_mode: settings.auto_mode.unwrap_or(true),
             classifying: None,
@@ -177,6 +183,7 @@ impl SedirApp {
             stats: Stats::default(),
             center_hz: center,
             vfo_hz: center,
+            lo_hz,
             gain_db: 30.0,
             auto_gain: false,
             view: View::full(2.4e6),
@@ -245,12 +252,14 @@ impl SedirApp {
         self.entry_note = self.frequency_note(self.vfo_hz).err().or_else(|| self.frequency_note(self.vfo_hz).ok().flatten());
     }
 
-    /// Whether `hz` can be received: Ok with an optional caution, or Err with the reason.
+    /// Whether the radio frequency `hz` can be received (after the converter, if any): Ok
+    /// with an optional caution, or Err with the reason. The range is given in radio
+    /// frequencies too.
     fn frequency_note(&self, hz: f64) -> Result<Option<(String, Color32)>, (String, Color32)> {
         let t = self.t();
         let name = self.device().map_or(DeviceKind::Other.name(), |d| d.kind.name());
-        let (lo, hi) = (freq::short(self.limits.min_hz), freq::short(self.limits.max_hz));
-        match self.limits.check(hz) {
+        let (lo, hi) = (freq::short(self.limits.min_hz + self.lo_hz), freq::short(self.limits.max_hz + self.lo_hz));
+        match self.limits.check(hz - self.lo_hz) {
             FreqCheck::Ok => Ok(None),
             FreqCheck::Weak => {
                 let below = freq::short(self.limits.weak_below_hz.unwrap_or(0.0));
@@ -292,7 +301,7 @@ impl SedirApp {
             self.entry_note = Some(note);
             return;
         }
-        let tuning = Tuning { center_hz: self.center_hz, sample_rate: self.sample_rate, gain: self.gain() };
+        let tuning = Tuning { center_hz: self.center_hz - self.lo_hz, sample_rate: self.sample_rate, gain: self.gain() };
         self.view = self.view.clamped(self.sample_rate);
         let ctx = ctx.clone();
         self.handle = Some(source::spawn(device.clone(), tuning, self.view, move || ctx.request_repaint()));
@@ -354,6 +363,21 @@ impl SedirApp {
         self.settings.save();
     }
 
+    /// Changes the converter LO. The receiver stays tuned where it is; the radio
+    /// frequencies shown move with the LO.
+    fn set_converter(&mut self, lo: f64) {
+        let shift = lo - self.lo_hz;
+        self.lo_hz = lo;
+        self.center_hz += shift;
+        self.vfo_hz += shift;
+        self.frame = None;
+        self.signals.clear();
+        self.classification = None;
+        self.settings.lo_hz = Some(lo);
+        self.settings.frequency_hz = Some(self.vfo_hz);
+        self.settings.save();
+    }
+
     /// A click on the spectrum at `hz`, on `signal` if one was found there. With automatic
     /// mode the signal is measured and the result applied when it arrives; otherwise the
     /// current mode is kept.
@@ -365,7 +389,7 @@ impl SedirApp {
             // Replaces a job still running: its channel closes and it stops.
             self.send(Command::Subscribe(CLASSIFY_ID, tx));
             let width = signal.map_or(3e3, |s| s.bandwidth_hz);
-            self.classifying = Some(classify::spawn_job(rx, target, width));
+            self.classifying = Some(classify::spawn_job(rx, target - self.lo_hz, width, self.lo_hz));
             self.classification = None;
         } else {
             let hz = match signal {
@@ -392,7 +416,7 @@ impl SedirApp {
     /// Hands the current listening settings to the demodulator thread.
     fn sync_listener(&self) {
         let squelch = self.squelch_on.then_some(self.squelch_db);
-        let (frequency, mode, bandwidth) = (self.vfo_hz, self.mode, self.bandwidth_hz);
+        let (frequency, mode, bandwidth) = (self.vfo_hz - self.lo_hz, self.mode, self.bandwidth_hz);
         self.listener.update(|s| {
             s.frequency_hz = frequency;
             s.mode = mode;
@@ -460,7 +484,7 @@ impl SedirApp {
             Ok(note) => {
                 self.entry_note = note;
                 self.center_hz = hz.round();
-                self.send(Command::Tune(self.center_hz));
+                self.send(Command::Tune(self.center_hz - self.lo_hz));
                 true
             }
         }
@@ -507,11 +531,12 @@ impl SedirApp {
     // ---- Spectrum data ----
 
     fn push_frame(&mut self, frame: Frame) {
+        // The source works in the receiver's own frequencies; the window in radio frequencies.
         let info = FrameInfo {
-            center_hz: frame.center_hz,
+            center_hz: frame.center_hz + self.lo_hz,
             sample_rate: frame.sample_rate,
-            lo_hz: frame.lo_hz,
-            hi_hz: frame.hi_hz,
+            lo_hz: frame.lo_hz + self.lo_hz,
+            hi_hz: frame.hi_hz + self.lo_hz,
             bin_hz: frame.bin_hz,
             points: frame.db.len(),
         };
@@ -576,7 +601,8 @@ impl SedirApp {
                 .filter(|s| (FM_BANDS_HZ.0..=FM_BANDS_HZ.1).contains(&s.center_hz))
                 .collect();
             fm.sort_by(|a, b| b.snr_db.total_cmp(&a.snr_db));
-            self.stations.set_targets(fm.iter().map(|s| s.center_hz).collect());
+            // The scanner and the name store work in the receiver's frequencies.
+            self.stations.set_targets(fm.iter().map(|s| s.center_hz - self.lo_hz).collect());
         }
     }
 
@@ -864,6 +890,25 @@ impl SedirApp {
         }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
+            ui.label(t.converter).on_hover_text(t.converter_tooltip);
+            let presets = [(0.0, t.converter_none), (9_750e6, t.converter_qo100), (-125e6, t.converter_upconverter)];
+            let current = presets.iter().find(|p| p.0 == self.lo_hz).map_or_else(|| freq::short(self.lo_hz.abs()), |p| p.1.to_string());
+            let mut lo = self.lo_hz;
+            egui::ComboBox::from_id_salt("converter").selected_text(current).show_ui(ui, |ui| {
+                for (value, name) in presets {
+                    ui.selectable_value(&mut lo, value, name);
+                }
+            });
+            let mut mhz = lo / 1e6;
+            if ui.add(egui::DragValue::new(&mut mhz).speed(1.0).suffix(" MHz").max_decimals(3)).changed() {
+                lo = mhz * 1e6;
+            }
+            if lo != self.lo_hz {
+                self.set_converter(lo);
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
             ui.label(t.step);
             egui::ComboBox::from_id_salt("step").selected_text(freq::short(self.step_hz)).show_ui(ui, |ui| {
                 for s in STEPS {
@@ -947,7 +992,7 @@ impl SedirApp {
                     for s in &self.signals {
                         let selected = (self.vfo_hz - s.center_hz).abs() <= s.bandwidth_hz / 2.0;
                         let mut text = format!("{:.3}  ·  {}  ·  {:.0} dB", s.center_hz / 1e6, freq::width(s.bandwidth_hz), s.snr_db);
-                        if let Some(name) = self.stations.name_near(s.center_hz) {
+                        if let Some(name) = self.stations.name_near(s.center_hz - self.lo_hz) {
                             text = format!("{name}  ·  {text}");
                         }
                         let text = RichText::new(text).monospace().size(12.0);
@@ -1057,7 +1102,7 @@ impl SedirApp {
         let mut placed: Vec<Rect> = Vec::new();
         let mut named: Vec<(&Signal, f64, String)> = Vec::new();
         for s in &self.signals {
-            let Some((station, name)) = self.stations.station_near(s.center_hz) else { continue };
+            let Some((station, name)) = self.stations.station_near(s.center_hz - self.lo_hz) else { continue };
             // One label per station, on its strongest signal.
             match named.iter_mut().find(|(_, f, _)| *f == station) {
                 Some(entry) if entry.0.snr_db < s.snr_db => entry.0 = s,

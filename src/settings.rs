@@ -23,6 +23,8 @@ pub struct Settings {
     pub find_names: Option<bool>,
     /// Whether clicking a signal recognises its mode.
     pub auto_mode: Option<bool>,
+    /// Converter local oscillator (Hz), e.g. 9750 MHz for a QO-100 LNB.
+    pub lo_hz: Option<f64>,
 }
 
 fn path() -> Option<PathBuf> {
@@ -53,6 +55,7 @@ impl Settings {
                 "volume" => s.volume = value.parse().ok(),
                 "find_names" => s.find_names = value.parse().ok(),
                 "auto_mode" => s.auto_mode = value.parse().ok(),
+                "lo_hz" => s.lo_hz = value.parse().ok(),
                 _ => {}
             }
         }
@@ -91,6 +94,9 @@ impl Settings {
         if let Some(a) = self.auto_mode {
             out += &format!("auto_mode={a}\n");
         }
+        if let Some(lo) = self.lo_hz {
+            out += &format!("lo_hz={lo}\n");
+        }
         out
     }
 
@@ -126,6 +132,7 @@ mod tests {
             volume: Some(70.0),
             find_names: Some(false),
             auto_mode: Some(true),
+            lo_hz: Some(9_750e6),
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
     }

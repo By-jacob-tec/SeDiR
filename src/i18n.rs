@@ -134,6 +134,11 @@ pub struct Strings {
     pub not_recognised: &'static str,
     /// Texts for classify::Reason, in its order.
     pub reasons: [&'static str; 8],
+    pub converter: &'static str,
+    pub converter_tooltip: &'static str,
+    pub converter_none: &'static str,
+    pub converter_qo100: &'static str,
+    pub converter_upconverter: &'static str,
 }
 
 pub static EN: Strings = Strings {
@@ -223,6 +228,11 @@ pub static EN: Strings = Strings {
         "keyed on and off",
         "band plan",
     ],
+    converter: "Converter LO",
+    converter_tooltip: "Local oscillator of an LNB or converter in front of the receiver. Frequencies are shown and typed as radio frequencies; the receiver is tuned to radio frequency minus this.",
+    converter_none: "None",
+    converter_qo100: "QO-100 LNB (9750 MHz)",
+    converter_upconverter: "HF up-converter (125 MHz)",
 };
 
 pub static TR: Strings = Strings {
@@ -312,6 +322,11 @@ pub static TR: Strings = Strings {
         "açılıp kapanıyor",
         "bant planı",
     ],
+    converter: "Dönüştürücü LO",
+    converter_tooltip: "Alıcının önündeki LNB ya da dönüştürücünün yerel osilatörü. Frekanslar gerçek radyo frekansı olarak gösterilir ve yazılır; alıcı, radyo frekansından bu değer çıkarılarak ayarlanır.",
+    converter_none: "Yok",
+    converter_qo100: "QO-100 LNB (9750 MHz)",
+    converter_upconverter: "HF yukarı dönüştürücü (125 MHz)",
 };
 
 #[cfg(test)]

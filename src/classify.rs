@@ -262,15 +262,17 @@ pub fn decide(f: &Features, center_hz: f64) -> Classification {
     Classification { mode, confidence, frequency_hz: frequency.round(), bandwidth_hz: bandwidth, reasons }
 }
 
-/// Collects the signal around `hz` from source blocks and classifies it. `width_hz` is the
-/// rough width seen on the spectrum. Returns None if the band moved away meanwhile.
-pub fn spawn_job(blocks: Receiver<Block>, hz: f64, width_hz: f64) -> Receiver<Option<Classification>> {
+/// Collects the signal around `hz` (receiver frequency) from source blocks and classifies
+/// it. `width_hz` is the rough width seen on the spectrum; `lo_hz` the converter offset,
+/// added to give radio frequencies (for the band plan and the result). Returns None if
+/// the band moved away meanwhile.
+pub fn spawn_job(blocks: Receiver<Block>, hz: f64, width_hz: f64, lo_hz: f64) -> Receiver<Option<Classification>> {
     let (tx, rx) = mpsc::sync_channel(1);
-    thread::Builder::new().name("classify".into()).spawn(move || job(blocks, hz, width_hz, tx)).expect("classify thread");
+    thread::Builder::new().name("classify".into()).spawn(move || job(blocks, hz, width_hz, lo_hz, tx)).expect("classify thread");
     rx
 }
 
-fn job(blocks: Receiver<Block>, hz: f64, width_hz: f64, result: SyncSender<Option<Classification>>) {
+fn job(blocks: Receiver<Block>, hz: f64, width_hz: f64, lo_hz: f64, result: SyncSender<Option<Classification>>) {
     // Analysis rate: room for the signal and some noise either side, at least 24 kHz.
     let target = (width_hz * 1.6).max(24e3);
     let started = Instant::now();
@@ -315,7 +317,7 @@ fn job(blocks: Receiver<Block>, hz: f64, width_hz: f64, result: SyncSender<Optio
         }
         collected.extend_from_slice(&a);
         if collected.len() as f64 >= *rate * ANALYSIS_SECONDS {
-            let verdict = measure(&collected, *rate).map(|f| decide(&f, hz));
+            let verdict = measure(&collected, *rate).map(|f| decide(&f, hz + lo_hz));
             let _ = result.send(verdict);
             return;
         }
@@ -441,7 +443,7 @@ mod tests {
         for (i, mhz) in list.split(',').filter_map(|v| v.trim().parse::<f64>().ok()).enumerate() {
             let (tx, rx) = std::sync::mpsc::sync_channel(32);
             handle.commands.send(Command::Subscribe(10 + i as u32, tx)).unwrap();
-            let result = spawn_job(rx, mhz * 1e6, 150e3).recv().unwrap();
+            let result = spawn_job(rx, mhz * 1e6, 150e3, 0.0).recv().unwrap();
             println!("{mhz} MHz → {result:?}");
         }
     }

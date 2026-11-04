@@ -5,6 +5,10 @@ use crate::demod::Mode;
 
 /// (from MHz, to MHz, mode), first match wins: narrow special segments before wide bands.
 const BANDS: &[(f64, f64, Mode)] = &[
+    // QO-100 narrow-band transponder downlink (AMSAT-DL band plan): CW beacon and CW,
+    // then narrow digital modes (FT8 at 10489.540) and SSB, all in upper sideband.
+    (10489.495, 10489.540, Mode::Cw),
+    (10489.540, 10490.000, Mode::Usb),
     // Amateur CW segments.
     (1.810, 1.838, Mode::Cw),
     (3.500, 3.570, Mode::Cw),
@@ -88,5 +92,7 @@ mod tests {
         assert_eq!(hint(144.300e6), Some(Mode::Usb));
         assert_eq!(hint(446.006e6), Some(Mode::Nfm));
         assert_eq!(hint(2.4e9), None);
+        assert_eq!(hint(10489.520e6), Some(Mode::Cw));
+        assert_eq!(hint(10489.750e6), Some(Mode::Usb));
     }
 }
