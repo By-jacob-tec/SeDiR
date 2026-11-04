@@ -312,21 +312,42 @@ pub fn slot_dir() -> Option<std::path::PathBuf> {
     crate::classify::analysis_dir().and_then(|d| d.parent().map(|p| p.join("ft8")))
 }
 
-/// Writes a slot's baseband (cf32 at RATE, the dial 1600 Hz below its centre) so that
-/// missed decodes can be studied; the oldest beyond `KEEP_SLOTS` are removed.
-fn save_slot(samples: &[Complex<f32>], slot: u64) {
-    let Some(dir) = slot_dir() else { return };
-    if std::fs::create_dir_all(&dir).is_err() {
+/// Slots with a disturbance kept apart, for longer.
+const KEEP_EVENTS: usize = 20;
+
+/// Whether the noise jumps somewhere in the slot: a 40 ms stretch with more than twice
+/// (3 dB) the median power, as when the LNB's PLL briefly loses lock.
+fn has_burst(samples: &[Complex<f32>]) -> bool {
+    let power: Vec<f32> = samples.chunks(256).map(|c| c.iter().map(|z| z.norm_sqr()).sum::<f32>() / c.len() as f32).collect();
+    let mut sorted = power.clone();
+    sorted.sort_by(f32::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    median > 0.0 && power.iter().any(|&p| p > median * 2.0)
+}
+
+fn write_slot(dir: &std::path::Path, samples: &[Complex<f32>], slot: u64, keep: usize) {
+    if std::fs::create_dir_all(dir).is_err() {
         return;
     }
     let bytes: Vec<u8> = samples.iter().flat_map(|z| [z.re.to_le_bytes(), z.im.to_le_bytes()].concat()).collect();
     let _ = std::fs::write(dir.join(format!("{slot}.cf32")), bytes);
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
         let mut files: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "cf32")).collect();
         files.sort();
-        for old in files.iter().take(files.len().saturating_sub(KEEP_SLOTS)) {
+        for old in files.iter().take(files.len().saturating_sub(keep)) {
             let _ = std::fs::remove_file(old);
         }
+    }
+}
+
+/// Writes a slot's baseband (cf32 at RATE, the dial 1600 Hz below its centre, from
+/// `EARLY_S` before the slot) so that missed decodes can be studied; the last
+/// `KEEP_SLOTS` are kept, and slots with a noise burst also go to `events`.
+fn save_slot(samples: &[Complex<f32>], slot: u64) {
+    let Some(dir) = slot_dir() else { return };
+    write_slot(&dir, samples, slot, KEEP_SLOTS);
+    if has_burst(samples) {
+        write_slot(&dir.join("events"), samples, slot, KEEP_EVENTS);
     }
 }
 

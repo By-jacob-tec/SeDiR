@@ -92,6 +92,31 @@ impl Spectrogram {
         Some(p)
     }
 
+    /// Sync where each Costas block may sit up to `reach` bins (half tones) from `f` on
+    /// its own: a signal that drifts or steps during its transmission keeps its score.
+    fn sync_drifting(&self, t0: usize, f: usize, reach: usize) -> f32 {
+        let (mut on, mut all) = (0f32, 0f32);
+        for block in [0usize, 36, 72] {
+            let mut best = (0f32, 0f32, -1f32);
+            for ff in f.saturating_sub(reach)..=f + reach {
+                let (mut o, mut a) = (0f32, 0f32);
+                for (k, &tone) in COSTAS.iter().enumerate() {
+                    if let Some(p) = self.symbol(t0, ff, block + k) {
+                        o += p[tone];
+                        a += p.iter().sum::<f32>() / 8.0;
+                    }
+                }
+                let ratio = if a > 0.0 { o / a } else { 0.0 };
+                if ratio > best.2 {
+                    best = (o, a, ratio);
+                }
+            }
+            on += best.0;
+            all += best.1;
+        }
+        if all > 0.0 { on / all } else { 0.0 }
+    }
+
     /// How strongly the Costas blocks stand out at (t0, f).
     fn sync(&self, t0: usize, f: usize) -> f32 {
         let (mut on, mut all) = (0f32, 0f32);
@@ -145,8 +170,15 @@ const FINE_DECIMATION: usize = SPS / FINE_SPS;
 /// One candidate, brought down to `FINE_RATE` with its tones centred on 0 Hz, and the
 /// tone powers of its 79 symbols at the best time and frequency.
 struct Fine {
-    /// Tone powers, [symbol][tone].
+    /// Tone powers, [symbol][tone], at one frequency for the whole transmission.
     power: Vec<[f32; 8]>,
+    /// The same with the frequency measured on each Costas block separately and carried
+    /// between them: follows a signal that drifts or steps during the transmission (an
+    /// unsteady LNB, a sender's drifting oscillator).
+    tracked: Vec<[f32; 8]>,
+    /// Frequency of each Costas block against `freq_hz` (Hz).
+    #[cfg_attr(not(test), allow(dead_code))]
+    block_df: [f64; 3],
     /// Start of symbol 0 (seconds from the slot start) and tone 0 (Hz from the
     /// baseband centre), as refined.
     start_s: f64,
@@ -159,7 +191,7 @@ struct Fine {
 /// tones are measured there by direct DFT. The coarse grid alone (40 ms, 3.125 Hz) put
 /// signals on the air up to a fifth of a symbol and 2 Hz off, spilling energy into the
 /// neighbouring symbols and tones.
-fn refine(samples: &[Complex<f32>], t0: usize, freq_hz: f64, taps: &[f32]) -> Option<Fine> {
+fn refine(samples: &[Complex<f32>], t0: usize, freq_hz: f64, taps: &[f32], wide: bool) -> Option<Fine> {
     use crate::demod::{FirDecimator, Mixer};
     // Centre of the 8 tones at 0 Hz.
     let centre = freq_hz + 3.5 * 6.25;
@@ -208,12 +240,14 @@ fn refine(samples: &[Complex<f32>], t0: usize, freq_hz: f64, taps: &[f32]) -> Op
         }
         if all > 0.0 { on / all } else { 0.0 }
     };
-    // Coarse then fine: ±8 samples (±40 ms) in 2s and ±2 Hz in 0.5 Hz, then around the
-    // best in single samples and 0.25 Hz.
+    // Coarse then fine: ±8 samples (±40 ms) in 2s and ±2 Hz (±10 Hz when `wide`, for
+    // candidates of the drift-tolerant pass) in 0.5 Hz, then around the best in single
+    // samples and 0.25 Hz.
     let base = coarse.round() as isize;
     let mut best = (f32::MIN, base, 0.0f64);
+    let reach = if wide { 20 } else { 4 };
     for dt in (-8..=8).step_by(2) {
-        for k in -4..=4 {
+        for k in -reach..=reach {
             let df = k as f64 * 0.5;
             let s = sync_at(base + dt, df);
             if s > best.0 {
@@ -233,8 +267,39 @@ fn refine(samples: &[Complex<f32>], t0: usize, freq_hz: f64, taps: &[f32]) -> Op
     }
     let (_, offset, df) = best;
     let power: Option<Vec<[f32; 8]>> = (0..SYMBOLS).map(|s| tone_power(offset + (s * FINE_SPS) as isize, df)).collect();
+
+    // Each Costas block's own frequency (±8 Hz around the common one), then a straight
+    // line between the block centres for the symbols in between.
+    let block_df: Vec<f64> = [0usize, 36, 72]
+        .iter()
+        .map(|&block| {
+            let fit = |d: f64| -> f32 {
+                COSTAS.iter().enumerate().filter_map(|(k, &tone)| tone_power(offset + ((block + k) * FINE_SPS) as isize, d).map(|p| p[tone] / p.iter().sum::<f32>().max(1e-20))).sum()
+            };
+            // In the wide pass the common frequency can sit at one end of a long drift,
+            // so the blocks are looked for ±16 Hz around it.
+            let span = if wide { 64 } else { 32 };
+            (-span..=span).map(|i| df + i as f64 * 0.25).max_by(|&a, &b| fit(a).total_cmp(&fit(b))).unwrap_or(df)
+        })
+        .collect();
+    let centres = [3.0, 39.0, 75.0];
+    let df_at = |s: usize| -> f64 {
+        let s = s as f64;
+        if s <= centres[1] {
+            block_df[0] + (block_df[1] - block_df[0]) * ((s - centres[0]) / (centres[1] - centres[0])).clamp(0.0, 1.0)
+        } else {
+            block_df[1] + (block_df[2] - block_df[1]) * ((s - centres[1]) / (centres[2] - centres[1])).clamp(0.0, 1.0)
+        }
+    };
+    let tracked: Option<Vec<[f32; 8]>> = (0..SYMBOLS).map(|s| tone_power(offset + (s * FINE_SPS) as isize, df_at(s))).collect();
     let start_s = (first as f64 + offset as f64 * FINE_DECIMATION as f64 - delay) / RATE;
-    Some(Fine { power: power?, start_s, freq_hz: freq_hz + df })
+    Some(Fine {
+        power: power?,
+        tracked: tracked?,
+        block_df: [block_df[0] - df, block_df[1] - df, block_df[2] - df],
+        start_s,
+        freq_hz: freq_hz + df,
+    })
 }
 
 /// Soft bits from refined tone powers (log-max over the Gray-coded tones), scaled to a
@@ -276,14 +341,38 @@ pub fn decode_slot(samples: &[Complex<f32>], lo_hz: f64, hi_hz: f64, book: &mut 
     let spec = Spectrogram::new(samples, lo_hz, hi_hz);
     let latest = (((EARLY_S + LATEST_START) * RATE) as usize / STEP).min(spec.rows.saturating_sub(1));
     let max_f = spec.width.saturating_sub(16);
+    let decoder = Decoder::default();
+    let taps = crate::demod::lowpass(40.0 / RATE, 513);
+    let mut found: Vec<Decoded> = Vec::new();
+    // Where decoded transmissions sit (start s, Hz): their sync peaks are not tried again.
+    let mut used: Vec<(f64, f64)> = Vec::new();
 
-    // Sync scores and their local maxima.
+    // First pass: the three sync blocks at one frequency, as a steady signal has them.
+    let steady = local_maxima(&spec, latest, max_f, |t0, f| spec.sync(t0, f));
+    try_candidates(&spec, samples, &steady, false, &decoder, &taps, book, &mut found, &mut used);
+    // Second pass, for what is left: each block may sit ±3 half tones (±9 Hz) from the
+    // others, and the frequency is searched widely (a drifting or stepping signal).
+    // (Tests can leave it out to measure what it adds.)
+    #[cfg(test)]
+    let second = std::env::var_os("SEDIR_FT8_ONE_PASS").is_none();
+    #[cfg(not(test))]
+    let second = true;
+    if second {
+        let drifting = local_maxima(&spec, latest, max_f, |t0, f| spec.sync_drifting(t0, f, 3));
+        try_candidates(&spec, samples, &drifting, true, &decoder, &taps, book, &mut found, &mut used);
+    }
+    found
+}
+
+/// Local maxima of a sync score over (row, bin), strongest first.
+fn local_maxima(spec: &Spectrogram, latest: usize, max_f: usize, score: impl Fn(usize, usize) -> f32) -> Vec<(f32, usize, usize)> {
     let mut scores = vec![0f32; (latest + 1) * max_f];
     for t0 in 0..=latest {
         for f in 0..max_f {
-            scores[t0 * max_f + f] = spec.sync(t0, f);
+            scores[t0 * max_f + f] = score(t0, f);
         }
     }
+    let _ = spec;
     let mut candidates: Vec<(f32, usize, usize)> = Vec::new();
     for t0 in 0..=latest {
         for f in 0..max_f {
@@ -311,27 +400,38 @@ pub fn decode_slot(samples: &[Complex<f32>], lo_hz: f64, hi_hz: f64, book: &mut 
     }
     candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
     candidates.truncate(MAX_CANDIDATES);
+    candidates
+}
 
-    // Noise per bin: the median power over the spectrogram.
-    let mut sample: Vec<f32> = spec.power.iter().step_by(7).copied().collect();
-    sample.sort_by(f32::total_cmp);
-    let noise = sample[sample.len() / 2].max(1e-20);
-
-    let _ = noise;
-    let decoder = Decoder::default();
-    let taps = crate::demod::lowpass(40.0 / RATE, 513);
-    let mut found: Vec<Decoded> = Vec::new();
-    let mut used: Vec<(f64, f64)> = Vec::new();
-    for (_, t0, f) in candidates {
+/// Refines and decodes candidates, adding new messages to `found`.
+#[allow(clippy::too_many_arguments)]
+fn try_candidates(
+    spec: &Spectrogram,
+    samples: &[Complex<f32>],
+    candidates: &[(f32, usize, usize)],
+    wide: bool,
+    decoder: &Decoder,
+    taps: &[f32],
+    book: &mut CallBook,
+    found: &mut Vec<Decoded>,
+    used: &mut Vec<(f64, f64)>,
+) {
+    for &(_, t0, f) in candidates {
         let coarse_hz = spec.first_hz + f as f64 * BIN_HZ;
         let coarse_s = (t0 * STEP) as f64 / RATE;
         // A decoded transmission also leaves sync peaks next to itself.
-        if used.iter().any(|&(s, hz)| (s - coarse_s).abs() < 0.2 && (hz - coarse_hz).abs() < 10.0) {
+        let near = if wide { 20.0 } else { 10.0 };
+        if used.iter().any(|&(s, hz)| (s - coarse_s).abs() < 0.2 && (hz - coarse_hz).abs() < near) {
             continue;
         }
-        let Some(fine) = refine(samples, t0, coarse_hz, &taps) else { continue };
-        let llr = fine_soft_bits(&fine.power);
-        let Some(word) = decoder.decode(&llr, 30) else { continue };
+        let Some(fine) = refine(samples, t0, coarse_hz, taps, wide) else { continue };
+        // One frequency first; if that fails, the frequency followed block by block.
+        let Some((word, power)) = [&fine.power, &fine.tracked]
+            .into_iter()
+            .find_map(|p| decoder.decode(&fine_soft_bits(p), 30).map(|w| (w, p)))
+        else {
+            continue;
+        };
         let msg = &word[..77];
         if msg.iter().all(|&b| b == 0) {
             continue;
@@ -349,7 +449,7 @@ pub fn decode_slot(samples: &[Complex<f32>], lo_hz: f64, hi_hz: f64, book: &mut 
         let sent = tones(&word);
         let mut signal = 0f32;
         let mut others: Vec<f32> = Vec::with_capacity(SYMBOLS * 7);
-        for (s, p) in fine.power.iter().enumerate() {
+        for (s, p) in power.iter().enumerate() {
             signal += p[sent[s]];
             others.extend(p.iter().enumerate().filter(|(j, _)| *j != sent[s]).map(|(_, v)| *v));
         }
@@ -359,7 +459,6 @@ pub fn decode_slot(samples: &[Complex<f32>], lo_hz: f64, hi_hz: f64, book: &mut 
         let snr = 10.0 * ((signal / noise_bin - 1.0).max(1e-3) as f64 * BIN_NOISE_HZ / SNR_BANDWIDTH_HZ).log10();
         found.push(Decoded { text, snr_db: snr as f32, dt_s: (fine.start_s - EARLY_S - START_SECONDS) as f32, freq_hz: fine.freq_hz });
     }
-    found
 }
 
 #[cfg(test)]
@@ -371,13 +470,18 @@ pub mod tests {
     /// An FT8 transmission (continuous-phase FSK) added to `out` at `RATE`.
     /// `start_s` is relative to the slot start; the buffer begins `EARLY_S` before it.
     pub fn add_signal(out: &mut [Complex<f32>], text: &str, freq_hz: f64, start_s: f64, amplitude: f32) {
+        add_drifting_signal(out, text, freq_hz, start_s, amplitude, 0.0);
+    }
+
+    /// As `add_signal`, the frequency moving by `drift_hz` over the transmission.
+    pub fn add_drifting_signal(out: &mut [Complex<f32>], text: &str, freq_hz: f64, start_s: f64, amplitude: f32, drift_hz: f64) {
         let bits = pack_standard(text).or_else(|| crate::ft8::message::pack_text(text)).expect(text);
         let word = ldpc::encode(&bits);
         let t = tones(&word);
         let start = ((start_s + EARLY_S) * RATE) as usize;
         let mut phase = 0.0f64;
         for (s, &tone) in t.iter().enumerate() {
-            let f = freq_hz + tone as f64 * 6.25;
+            let f = freq_hz + tone as f64 * 6.25 + drift_hz * s as f64 / SYMBOLS as f64;
             for i in 0..SPS {
                 let n = start + s * SPS + i;
                 if n < out.len() {
@@ -524,6 +628,63 @@ pub mod tests {
         println!("size {}x{}", spec.width, spec.rows);
     }
 
+    /// Looks for disturbances in the saved slots: rows whose total power jumps over the
+    /// slot's median (a noise burst across the band), and how far the strongest steady
+    /// signal moves around them. `cargo test --lib ft8_glitches -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn ft8_glitches() {
+        let dir = std::env::var_os("SEDIR_FT8_DIR").map(std::path::PathBuf::from).or_else(crate::ft8::worker::slot_dir).unwrap();
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "cf32")).collect();
+        files.sort();
+        for path in files {
+            let samples = crate::ft8::worker::load_slot(&path).unwrap();
+            let spec = Spectrogram::new(&samples, -1500.0, 1500.0);
+            // Noise level per row: the median bin (signals occupy few bins).
+            let level: Vec<f32> = (0..spec.rows)
+                .map(|r| {
+                    let mut row: Vec<f32> = (0..spec.width).map(|b| spec.at(r, b)).collect();
+                    row.sort_by(f32::total_cmp);
+                    row[row.len() / 2]
+                })
+                .collect();
+            let mut sorted = level.clone();
+            sorted.sort_by(f32::total_cmp);
+            let median = sorted[sorted.len() / 2];
+            let bursts: Vec<usize> = (0..spec.rows).filter(|&r| level[r] > median * 2.0).collect();
+            if bursts.is_empty() {
+                println!("{}: no burst", path.file_name().unwrap().to_string_lossy());
+                continue;
+            }
+            let first = bursts[0];
+            println!(
+                "{}: noise up {:.1} dB at {:.2}-{:.2} s ({} rows)",
+                path.file_name().unwrap().to_string_lossy(),
+                10.0 * (level[bursts.iter().copied().max_by(|&a, &b| level[a].total_cmp(&level[b])).unwrap()] / median).log10(),
+                first as f64 * STEP as f64 / RATE,
+                *bursts.last().unwrap() as f64 * STEP as f64 / RATE,
+                bursts.len()
+            );
+            // The strongest bin's position row by row around the burst (a steady carrier
+            // or an FT8 signal's tone shows the frequency step).
+            let lo = first.saturating_sub(12);
+            let hi = (bursts.last().unwrap() + 12).min(spec.rows - 1);
+            let col = (0..spec.width).max_by(|&a, &b| {
+                let sa: f32 = (lo..=hi).map(|r| spec.at(r, a)).sum();
+                let sb: f32 = (lo..=hi).map(|r| spec.at(r, b)).sum();
+                sa.total_cmp(&sb)
+            }).unwrap();
+            let track: Vec<String> = (lo..=hi)
+                .map(|r| {
+                    let (a, b) = (col.saturating_sub(20), (col + 20).min(spec.width - 1));
+                    let best = (a..=b).max_by(|&x, &y| spec.at(r, x).total_cmp(&spec.at(r, y))).unwrap();
+                    format!("{:+.0}", (best as f64 - col as f64) * BIN_HZ)
+                })
+                .collect();
+            println!("   strongest line around it (Hz, 40 ms steps): {}", track.join(" "));
+        }
+    }
+
     /// Decodes every saved slot: `cargo test --lib ft8_saved_decode -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -598,6 +759,32 @@ pub mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn decodes_a_drifting_signal() {
+        // 15 Hz of drift over the transmission: well over two tone spacings.
+        let mut x = noise(slot_len(), 1.0, 11);
+        add_drifting_signal(&mut x, "CQ TA4SO KM46", 200.0, 0.5, amplitude(-8.0), 15.0);
+        // What the refinement sees for the strongest sync candidates.
+        let spec = Spectrogram::new(&x, -1400.0, 1400.0);
+        let taps = crate::demod::lowpass(40.0 / RATE, 513);
+        let mut c: Vec<(f32, usize, usize)> = Vec::new();
+        for t0 in 0..120 {
+            for f in 0..spec.width - 16 {
+                c.push((spec.sync_drifting(t0, f, 3), t0, f));
+            }
+        }
+        c.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for &(s, t0, f) in c.iter().take(4) {
+            let hz = spec.first_hz + f as f64 * BIN_HZ;
+            if let Some(fine) = refine(&x, t0, hz, &taps, true) {
+                println!("sync {s:.2} t0 {t0} {hz:.1} Hz → {:.2} Hz, start {:.2} s, blocks {:?}", fine.freq_hz, fine.start_s - EARLY_S, fine.block_df);
+            }
+        }
+        let found = decode_slot(&x, -1400.0, 1400.0, &mut CallBook::default());
+        println!("{found:?}");
+        assert!(found.iter().any(|d| d.text == "CQ TA4SO KM46"));
     }
 
     #[test]

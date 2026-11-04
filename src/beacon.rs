@@ -154,7 +154,8 @@ fn run(blocks: Receiver<Block>, beacon_hz: f64, lo_hz: f64, mut correction: f64,
     let mut locked = false;
     // (signal time at the middle of the measurement, measured correction).
     let mut points: Vec<(f64, f64)> = Vec::new();
-    let mut outliers = 0;
+    // A measurement off the line, waiting for a second one to confirm a jump.
+    let mut pending: Option<(f64, f64)> = None;
     // Seconds of signal processed: the time axis of the drift (the blocks' own clock).
     let mut signal_time = 0.0f64;
     // Receiver frequency where the beacon is expected.
@@ -212,20 +213,28 @@ fn run(blocks: Receiver<Block>, beacon_hz: f64, lo_hz: f64, mut correction: f64,
                 // The beacon sits `offset` above where it was expected: the LO is that
                 // much lower than assumed, so the correction falls by it.
                 let measured = correction - offset;
-                // A measurement far off the line so far is set aside (three in a row
-                // mean the line itself is wrong: start a new one).
+                // A measurement far off the line is set aside; a second one agreeing with
+                // it means the LNB itself jumped (its PLL can slip): start a new line at
+                // the new level at once, rather than waiting while FT8 slots are lost.
                 if points.len() >= 3 {
                     let (value, slope) = fit_line(&points);
                     let predicted = value + slope * (middle - points.last().map_or(middle, |p| p.0));
                     if (measured - predicted).abs() > OUTLIER_HZ {
-                        outliers += 1;
-                        if outliers < 3 {
-                            continue;
+                        match pending {
+                            Some((t, v)) if (measured - v).abs() < OUTLIER_HZ / 2.0 => {
+                                points.clear();
+                                points.push((t, v));
+                                pending = None;
+                            }
+                            _ => {
+                                pending = Some((middle, measured));
+                                continue;
+                            }
                         }
-                        points.clear();
+                    } else {
+                        pending = None;
                     }
                 }
-                outliers = 0;
                 points.push((middle, measured));
                 if points.len() > FIT_OF {
                     points.remove(0);
@@ -247,6 +256,7 @@ fn run(blocks: Receiver<Block>, beacon_hz: f64, lo_hz: f64, mut correction: f64,
                     s.status = BeaconStatus::NotFound;
                     locked = false;
                     points.clear();
+                    pending = None;
                 }
             }
         }
@@ -267,6 +277,11 @@ mod tests {
 
     /// As `blocks`, with the beacon moving by `drift` Hz per second (a warming LNB).
     fn drifting_blocks(center_if: f64, rate: f64, beacon_if: f64, drift: f64, seconds: f64) -> Vec<Block> {
+        synthetic(center_if, rate, beacon_if, drift, (f64::INFINITY, 0.0), seconds)
+    }
+
+    /// The band with a drifting beacon that also jumps by `jump.1` Hz at `jump.0` s.
+    fn synthetic(center_if: f64, rate: f64, beacon_if: f64, drift: f64, jump: (f64, f64), seconds: f64) -> Vec<Block> {
         let mut seed = 7u32;
         let mut noise = move || {
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -278,8 +293,9 @@ mod tests {
                 let t = i as f64 / rate;
                 // Two-tone keying like the satellite's beacon: the upper tone half the time.
                 let shift = if (t * 4.0) as u32 % 2 == 0 { 0.0 } else { 393.0 };
-                // Phase of a frequency rising by `drift` Hz/s: everything moves with the LNB.
-                let moving = PI * drift * t * t;
+                // Phase of a frequency rising by `drift` Hz/s (and jumping): everything
+                // moves with the LNB.
+                let moving = PI * drift * t * t + if t > jump.0 { 2.0 * PI * jump.1 * (t - jump.0) } else { 0.0 };
                 let beacon = Complex::from_polar(0.05f32, (2.0 * PI * (beacon_if - center_if) * t + 2.0 * PI * shift * t + moving) as f32);
                 let cw = Complex::from_polar(0.2f32, (2.0 * PI * (beacon_if + 8e3 - center_if) * t + moving) as f32);
                 beacon + cw + Complex::new(noise(), noise()) * 0.02
@@ -343,6 +359,28 @@ mod tests {
         let c = s.correction_hz.unwrap();
         let on_line = [12.0, seconds].iter().any(|t| (c - (3_200.0 - 3.0 * t)).abs() < 3.0);
         assert!(on_line, "correction {c} is not on the drift line at 12 or 14 s");
+    }
+
+    #[test]
+    fn follows_a_jump_of_the_lnb_quickly() {
+        // The LNB jumps 200 Hz down at 8 s (its PLL slipped): the beacon shows 200 Hz higher,
+        // so the correction must fall by 200 Hz within a few measurements.
+        let lo = 9_750e6;
+        let beacon_if = QO100_BEACON_HZ - (lo + 3_200.0);
+        let (tx, rx) = mpsc::sync_channel(3000);
+        for b in synthetic(739.75e6, 2.4e6, beacon_if, 0.0, (8.0, 200.0), 18.0) {
+            tx.send(b).unwrap();
+        }
+        drop(tx);
+        let state = spawn(rx, QO100_BEACON_HZ, lo, 0.0);
+        let started = Instant::now();
+        while Arc::strong_count(&state) > 1 && started.elapsed() < Duration::from_secs(30) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let s = *state.lock().unwrap();
+        println!("{s:?}");
+        assert!((s.correction_hz.unwrap() - 3_000.0).abs() < 5.0, "correction {:?}", s.correction_hz);
+        assert!(s.rate_hz_per_s.abs() < 2.0, "rate {}", s.rate_hz_per_s);
     }
 
     /// On the satellite: `SEDIR_SOURCE=ip:192.168.1.47 cargo test --lib live_beacon -- --ignored --nocapture`
