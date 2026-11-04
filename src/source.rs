@@ -84,6 +84,8 @@ pub struct Stats {
     pub overflows: u64,
     /// Blocks the spectrum could not keep up with.
     pub dropped_blocks: u64,
+    /// Blocks the other subscribers (demodulators) could not keep up with.
+    pub dropped_listen: u64,
 }
 
 pub enum Event {
@@ -208,6 +210,8 @@ fn run(
             Err(TrySendError::Full(_)) => {
                 if id == SPECTRUM_ID {
                     stats.dropped_blocks += 1;
+                } else {
+                    stats.dropped_listen += 1;
                 }
                 true
             }

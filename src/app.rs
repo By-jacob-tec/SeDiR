@@ -7,9 +7,12 @@ use eframe::egui::{
     TextureOptions, pos2, vec2,
 };
 
+use sedir::audio::{self, AudioBuffer, AudioOutput, OutputDevice, Volume};
+use sedir::demod::Mode;
 use sedir::detect::{self, Signal};
 use sedir::device::{self, DeviceInfo, DeviceKind, FreqCheck, Limits};
 use sedir::freq;
+use sedir::listen::{ListenSettings, Listener};
 use sedir::radio::Tuning;
 use sedir::source::{self, Command, Event, Frame, Handle, Stats, View};
 
@@ -29,9 +32,14 @@ const DEFAULT_FREQUENCY: f64 = 145_500_000.0;
 const DEFAULT_THRESHOLD_DB: f32 = 8.0;
 /// Mouse wheel steps offered for the listening frequency (Hz).
 const STEPS: [f64; 12] = [1.0, 10.0, 100.0, 500.0, 1e3, 2.5e3, 5e3, 6.25e3, 10e3, 12.5e3, 25e3, 100e3];
-const DEFAULT_STEP: f64 = 5e3;
 /// Narrowest visible band offered (Hz).
 const MIN_SPAN: f64 = 5e3;
+/// Subscriber id of the listening thread at the source.
+const LISTEN_ID: u32 = 1;
+/// Blocks the listening thread may have queued (~0.6 s).
+const LISTEN_QUEUE: usize = 32;
+const LOGO_PIXELS: usize = 128;
+const DEFAULT_VOLUME: f32 = 60.0;
 
 #[derive(Clone, Copy, PartialEq)]
 struct FrameInfo {
@@ -77,6 +85,23 @@ pub struct SedirApp {
     waterfall_tex: Option<TextureHandle>,
     signals: Vec<Signal>,
     frames_since_scan: u32,
+
+    mode: Mode,
+    bandwidth_hz: f64,
+    squelch_on: bool,
+    squelch_db: f32,
+    listener: Listener,
+
+    audio_buffer: AudioBuffer,
+    volume: Volume,
+    volume_pct: f32,
+    muted: bool,
+    audio_devices: Vec<OutputDevice>,
+    audio_device: Option<String>,
+    audio: Option<AudioOutput>,
+    audio_error: Option<String>,
+
+    logo_tex: TextureHandle,
 }
 
 impl SedirApp {
@@ -85,7 +110,30 @@ impl SedirApp {
         let settings = Settings::load();
         let center = settings.frequency_hz.unwrap_or(DEFAULT_FREQUENCY);
         let limits = DeviceKind::Other.limits();
+        let mode = settings.mode.as_deref().and_then(Mode::from_name).unwrap_or(Mode::Nfm);
+        let volume_pct = settings.volume.unwrap_or(DEFAULT_VOLUME);
+        let logo = ColorImage::from_rgba_unmultiplied([LOGO_PIXELS, LOGO_PIXELS], &crate::logo::rgba(LOGO_PIXELS, false));
         let mut app = Self {
+            mode,
+            bandwidth_hz: mode.default_bandwidth(),
+            squelch_on: false,
+            squelch_db: -60.0,
+            listener: Listener::new(ListenSettings {
+                frequency_hz: center,
+                mode,
+                bandwidth_hz: mode.default_bandwidth(),
+                squelch_db: None,
+                audio_rate: 48_000.0,
+            }),
+            audio_buffer: AudioBuffer::default(),
+            volume: Volume::new(volume_gain(volume_pct)),
+            volume_pct,
+            muted: false,
+            audio_devices: audio::output_devices(),
+            audio_device: settings.audio_device.clone(),
+            audio: None,
+            audio_error: None,
+            logo_tex: cc.egui_ctx.load_texture("logo", logo, TextureOptions::LINEAR),
             lang: settings.lang.unwrap_or_else(Lang::from_system),
             threshold_db: settings.threshold_db.unwrap_or(DEFAULT_THRESHOLD_DB),
             settings,
@@ -105,7 +153,7 @@ impl SedirApp {
             gain_db: 30.0,
             auto_gain: false,
             view: View::full(2.4e6),
-            step_hz: DEFAULT_STEP,
+            step_hz: mode.default_step(),
             entry: String::new(),
             entry_note: None,
             frame: None,
@@ -221,6 +269,13 @@ impl SedirApp {
         self.view = self.view.clamped(self.sample_rate);
         let ctx = ctx.clone();
         self.handle = Some(source::spawn(device.clone(), tuning, self.view, move || ctx.request_repaint()));
+        let (tx, rx) = mpsc::sync_channel(LISTEN_QUEUE);
+        self.send(Command::Subscribe(LISTEN_ID, tx));
+        self.sync_listener();
+        self.listener.spawn(rx, self.audio_buffer.clone());
+        if self.audio.is_none() {
+            self.open_audio();
+        }
         self.opened = false;
         self.error = None;
         self.stats = Stats::default();
@@ -234,6 +289,51 @@ impl SedirApp {
         self.handle = None;
         self.opened = false;
         self.stats = Stats::default();
+        self.audio_buffer.clear();
+    }
+
+    // ---- Listening and sound ----
+
+    /// Opens the chosen playback device; the demodulator follows its sample rate.
+    fn open_audio(&mut self) {
+        self.audio = None;
+        self.audio_buffer.clear();
+        match audio::open(self.audio_device.as_deref(), self.audio_buffer.clone(), self.volume.clone()) {
+            Ok(out) => {
+                self.audio_error = None;
+                let rate = out.sample_rate as f64;
+                self.listener.update(|s| s.audio_rate = rate);
+                self.audio = Some(out);
+            }
+            Err(e) => self.audio_error = Some(e),
+        }
+    }
+
+    fn apply_volume(&self) {
+        self.volume.set(if self.muted { 0.0 } else { volume_gain(self.volume_pct) });
+    }
+
+    fn set_mode(&mut self, mode: Mode) {
+        if mode == self.mode {
+            return;
+        }
+        self.mode = mode;
+        self.bandwidth_hz = mode.default_bandwidth();
+        self.step_hz = mode.default_step();
+        self.settings.mode = Some(mode.name().to_string());
+        self.settings.save();
+    }
+
+    /// Hands the current listening settings to the demodulator thread.
+    fn sync_listener(&self) {
+        let squelch = self.squelch_on.then_some(self.squelch_db);
+        let (frequency, mode, bandwidth) = (self.vfo_hz, self.mode, self.bandwidth_hz);
+        self.listener.update(|s| {
+            s.frequency_hz = frequency;
+            s.mode = mode;
+            s.bandwidth_hz = bandwidth;
+            s.squelch_db = squelch;
+        });
     }
 
     fn poll_events(&mut self) {
@@ -416,6 +516,7 @@ impl SedirApp {
     fn header(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
         ui.horizontal(|ui| {
+            ui.add(egui::Image::new(&self.logo_tex).fit_to_exact_size(vec2(52.0, 52.0)));
             ui.vertical(|ui| {
                 brand(ui, 30.0);
                 ui.label(RichText::new(t.app_subtitle).size(12.0).color(MUTED));
@@ -428,8 +529,14 @@ impl SedirApp {
                     self.set_vfo(hz);
                 }
             });
+            ui.add_space(12.0);
+            ui.label(RichText::new(self.mode.name()).size(18.0).strong().monospace().color(AMBER));
+            if self.opened {
+                ui.add_space(8.0);
+                let level = self.listener.level_db();
+                metric(ui, t.level_caps, &format!("{level:.0} dBFS"), TEXT);
+            }
             if let Some(s) = self.signal_at(self.vfo_hz, 0.0) {
-                ui.add_space(16.0);
                 metric(ui, t.width_caps, &freq::short(s.bandwidth_hz), TEXT);
                 metric(ui, t.snr_caps, &format!("{:.0} dB", s.snr_db), snr_color(s.snr_db));
             }
@@ -475,8 +582,95 @@ impl SedirApp {
             let t = self.t();
             card(ui, t.card_receiver, |ui| self.receiver_card(ui));
             card(ui, t.card_frequency, |ui| self.frequency_card(ui));
+            card(ui, t.card_listen, |ui| self.listen_card(ui));
+            card(ui, t.card_audio, |ui| self.audio_card(ui));
             card(ui, t.card_view, |ui| self.view_card(ui));
         });
+    }
+
+    fn listen_card(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        let mut mode = self.mode;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for m in Mode::ALL {
+                let selected = mode == m;
+                let text = RichText::new(m.name()).monospace().strong().color(if selected { DEEP } else { TEXT });
+                let button = egui::Button::new(text).min_size(vec2(44.0, 26.0)).corner_radius(6);
+                let button = if selected { button.fill(ACCENT) } else { button };
+                if ui.add(button).clicked() {
+                    mode = m;
+                }
+            }
+        });
+        self.set_mode(mode);
+        ui.add_space(4.0);
+        let (lo, hi) = self.mode.bandwidth_range();
+        let mut khz = self.bandwidth_hz / 1e3;
+        ui.horizontal(|ui| {
+            ui.label(t.filter);
+            let step = if hi <= 4e3 { 0.05 } else { 0.5 };
+            if ui.add(egui::Slider::new(&mut khz, lo / 1e3..=hi / 1e3).step_by(step).suffix(" kHz")).changed() {
+                self.bandwidth_hz = khz * 1e3;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.squelch_on, t.squelch).on_hover_text(t.squelch_tooltip);
+            ui.add_enabled(self.squelch_on, egui::Slider::new(&mut self.squelch_db, -120.0..=0.0).step_by(1.0).suffix(" dB"));
+        });
+        if self.handle.is_some() {
+            level_bar(ui, self.listener.level_db(), self.squelch_on.then_some(self.squelch_db));
+        }
+    }
+
+    fn audio_card(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        let current = self
+            .audio_device
+            .as_ref()
+            .and_then(|id| self.audio_devices.iter().find(|d| &d.id == id))
+            .map_or(t.system_default.to_string(), |d| d.name.clone());
+        let mut choice = self.audio_device.clone();
+        ui.label(t.output);
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("audio_device").width(ui.available_width() - 36.0).selected_text(current).show_ui(ui, |ui| {
+                ui.selectable_value(&mut choice, None, t.system_default);
+                for d in &self.audio_devices {
+                    ui.selectable_value(&mut choice, Some(d.id.clone()), &d.name);
+                }
+            });
+            if ui.button("⟳").on_hover_text(t.refresh_audio).clicked() {
+                self.audio_devices = audio::output_devices();
+            }
+        });
+        if choice != self.audio_device {
+            self.audio_device = choice;
+            self.settings.audio_device = self.audio_device.clone();
+            self.settings.save();
+            if self.audio.is_some() || self.handle.is_some() {
+                self.open_audio();
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label(t.volume);
+            let slider = ui.add(egui::Slider::new(&mut self.volume_pct, 0.0..=100.0).step_by(1.0).suffix(" %"));
+            if slider.changed() {
+                self.apply_volume();
+            }
+            if slider.drag_stopped() || slider.lost_focus() {
+                self.settings.volume = Some(self.volume_pct);
+                self.settings.save();
+            }
+        });
+        if ui.checkbox(&mut self.muted, t.mute).changed() {
+            self.apply_volume();
+        }
+        if let Some(out) = &self.audio {
+            ui.label(RichText::new(format!("{} · {} kHz", out.name, out.sample_rate as f64 / 1e3)).size(11.0).color(MUTED));
+        }
+        if let Some(e) = &self.audio_error {
+            ui.label(RichText::new(fill(t.audio_error, &[e])).size(12.0).color(BAD));
+        }
     }
 
     fn receiver_card(&mut self, ui: &mut egui::Ui) {
@@ -754,6 +948,15 @@ impl SedirApp {
             painter.add(Shape::line(points, Stroke::new(1.3, SPECTRUM)));
         }
 
+        // Band the demodulator hears.
+        let (plo, phi) = self.mode.passband(self.bandwidth_hz);
+        let (ax, bx) = (x_of(self.vfo_hz + plo), x_of(self.vfo_hz + phi).max(x_of(self.vfo_hz + plo) + 2.0));
+        let pass = Rect::from_x_y_ranges(ax..=bx, spec_rect.top()..=wf_rect.bottom());
+        painter.rect_filled(pass, CornerRadius::ZERO, AMBER.gamma_multiply(0.13));
+        for x in [ax, bx] {
+            painter.line_segment([pos2(x, spec_rect.top()), pos2(x, spec_rect.bottom())], Stroke::new(1.0, AMBER.gamma_multiply(0.5)));
+        }
+
         // Listening frequency.
         let vx = x_of(self.vfo_hz);
         if (full.left()..=full.right()).contains(&vx) {
@@ -810,8 +1013,9 @@ impl SedirApp {
         if let Some(pos) = response.interact_pointer_pos() {
             if response.clicked() || response.double_clicked() {
                 let hz = hz_of(pos.x);
-                // A click on a found signal selects its centre.
-                let hz = self.signal_at(hz, 3.0 * hz_per_px).map_or(hz, |s| s.center_hz);
+                // A click on a found signal selects its centre (in modes with a centre to find).
+                let snapped = self.mode.snaps_to_center().then(|| self.signal_at(hz, 3.0 * hz_per_px)).flatten();
+                let hz = snapped.map_or(hz, |s| s.center_hz);
                 self.set_vfo(hz);
                 if response.double_clicked() && self.retune(self.vfo_hz) {
                     self.set_view(View { offset_hz: 0.0, span_hz: self.view.span_hz });
@@ -860,6 +1064,11 @@ impl eframe::App for SedirApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_discovery();
         self.poll_events();
+        self.sync_listener();
+        if self.handle.is_some() {
+            // Keeps the signal meter moving between spectrum frames.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         let bar = egui::Frame::new().fill(CARD).inner_margin(egui::Margin::symmetric(14, 8));
         egui::Panel::top("header").frame(bar).show(ui, |ui| self.header(ui));
@@ -876,6 +1085,29 @@ impl eframe::App for SedirApp {
             .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(10)))
             .show(ui, |ui| self.central(ui));
     }
+}
+
+/// Horizontal meter of the listened signal's power, with the squelch level marked.
+fn level_bar(ui: &mut egui::Ui, db: f32, squelch: Option<f32>) {
+    let (lo, hi) = (-120.0f32, 0.0f32);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 14.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(4), DEEP);
+    let k = ((db - lo) / (hi - lo)).clamp(0.0, 1.0);
+    let open = squelch.is_none_or(|s| db >= s);
+    let fill_rect = Rect::from_min_size(rect.min, vec2(rect.width() * k, rect.height()));
+    painter.rect_filled(fill_rect, CornerRadius::same(4), if open { ACCENT } else { MUTED });
+    if let Some(s) = squelch {
+        let x = rect.left() + rect.width() * ((s - lo) / (hi - lo)).clamp(0.0, 1.0);
+        painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(2.0, AMBER));
+    }
+    painter.text(rect.right_center() - vec2(4.0, 0.0), Align2::RIGHT_CENTER, format!("{db:.0} dBFS"), FontId::monospace(10.0), TEXT);
+}
+
+/// Volume percent to a gain factor (squared, which sounds closer to even steps).
+fn volume_gain(percent: f32) -> f32 {
+    let v = percent / 100.0;
+    v * v * 1.5
 }
 
 /// 145_500_000 → "145.500 000".

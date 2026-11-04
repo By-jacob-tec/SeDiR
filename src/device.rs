@@ -86,12 +86,13 @@ impl DeviceKind {
                 auto_gain: true,
                 weak_below_hz: None,
             },
-            // Gigabit Ethernet: 12 MS/s measured without loss.
+            // Gigabit Ethernet: 10 MS/s arrives in full every time; 12 MS/s mostly, but
+            // the link has dropped to ~10.6 MS/s in some runs.
             DeviceKind::LibreSdr => Limits {
                 min_hz: 70e6,
                 max_hz: 6e9,
                 rates: ms(&[2.4, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0]),
-                max_rate: 12e6,
+                max_rate: 10e6,
                 gain: (0.0, 71.0),
                 auto_gain: true,
                 weak_below_hz: None,

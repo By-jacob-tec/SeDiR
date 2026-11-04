@@ -107,6 +107,18 @@ pub struct Strings {
     pub center: &'static str,
     pub snr_caps: &'static str,
     pub width_caps: &'static str,
+    pub level_caps: &'static str,
+    pub card_listen: &'static str,
+    pub card_audio: &'static str,
+    pub filter: &'static str,
+    pub squelch: &'static str,
+    pub squelch_tooltip: &'static str,
+    pub output: &'static str,
+    pub system_default: &'static str,
+    pub volume: &'static str,
+    pub mute: &'static str,
+    pub refresh_audio: &'static str,
+    pub audio_error: &'static str,
 }
 
 pub static EN: Strings = Strings {
@@ -157,6 +169,18 @@ pub static EN: Strings = Strings {
     center: "Centre",
     snr_caps: "SNR",
     width_caps: "WIDTH",
+    level_caps: "SIGNAL",
+    card_listen: "LISTEN",
+    card_audio: "SOUND",
+    filter: "Filter",
+    squelch: "Squelch",
+    squelch_tooltip: "Silences the sound while the signal in the filter is below this level.",
+    output: "Output",
+    system_default: "System default",
+    volume: "Volume",
+    mute: "Mute",
+    refresh_audio: "Refresh the list of sound devices",
+    audio_error: "Sound: {}",
 };
 
 pub static TR: Strings = Strings {
@@ -207,6 +231,18 @@ pub static TR: Strings = Strings {
     center: "Ortala",
     snr_caps: "SNR",
     width_caps: "GENİŞLİK",
+    level_caps: "SİNYAL",
+    card_listen: "DİNLEME",
+    card_audio: "SES",
+    filter: "Filtre",
+    squelch: "Susturucu",
+    squelch_tooltip: "Filtredeki sinyal bu düzeyin altındayken sesi keser.",
+    output: "Çıkış",
+    system_default: "Sistem varsayılanı",
+    volume: "Ses düzeyi",
+    mute: "Sessiz",
+    refresh_audio: "Ses cihazı listesini yenile",
+    audio_error: "Ses: {}",
 };
 
 #[cfg(test)]

@@ -56,14 +56,22 @@ pub fn apply_theme(ctx: &egui::Context) {
     });
 }
 
-/// The program name with S, D and R emphasised.
+/// The program name as in the logo: S, D and R large in the tree's yellow-to-amber
+/// colours, e and i smaller in cedar green.
 pub fn brand(ui: &mut egui::Ui, size: f32) {
+    const COLORS: [Color32; 5] = [
+        Color32::from_rgb(0xf0, 0xd0, 0x3a),
+        Color32::from_rgb(0x75, 0xc3, 0x81),
+        Color32::from_rgb(0xf0, 0xa6, 0x3a),
+        Color32::from_rgb(0x75, 0xc3, 0x81),
+        Color32::from_rgb(0xe8, 0x89, 0x3a),
+    ];
     let mut job = LayoutJob::default();
-    for c in "SeDiR".chars() {
+    for (c, color) in "SeDiR".chars().zip(COLORS) {
         let big = c.is_ascii_uppercase();
         let format = egui::TextFormat {
-            font_id: FontId::proportional(if big { size } else { size * 0.72 }),
-            color: if big { TEXT } else { ACCENT },
+            font_id: FontId::proportional(if big { size } else { size * 0.68 }),
+            color,
             valign: egui::Align::BOTTOM,
             ..Default::default()
         };

@@ -1,9 +1,9 @@
 # SeDiR
 
 Wideband SDR receiver written in Rust: a colour spectrum and waterfall over the widest band
-your receiver can carry, with every signal in view found and listed. Clicking a signal
-selects it for listening. Analog demodulation (AM, NFM, WFM, SSB, CW) and digital modes
-(RTTY, PSK31, FT8, FT4) are on the way.
+your receiver can carry, with every signal in view found and listed. Click a signal to
+listen to it in AM, NFM, WFM, USB, LSB or CW, on the sound device of your choice.
+Automatic mode recognition and digital modes (RTTY, PSK31, FT8, FT4) are on the way.
 
 *Sedir* is the Taurus cedar that grows in Muğla, Turkey.
 
@@ -16,7 +16,7 @@ Found automatically when the program starts:
 | RTL-SDR (R820T/R828D) | SoapySDR | 24 MHz – 1.766 GHz | 2.4 MS/s |
 | HackRF One | SoapySDR | 1 MHz – 6 GHz | 20 MS/s |
 | ADALM-Pluto | libiio (USB or network) | 325 MHz – 3.8 GHz (wider on units with the AD9364 range) | ~4 MS/s over USB |
-| LibreSDR / AD9361 boards | libiio (network) | 70 MHz – 6 GHz | 12 MS/s on gigabit Ethernet |
+| LibreSDR / AD9361 boards | libiio (network) | 70 MHz – 6 GHz | 10 MS/s on gigabit Ethernet |
 
 Once the device is open, the range it reports replaces the nominal one. A frequency outside
 the range is refused with a warning. The status bar shows how many samples actually arrive:

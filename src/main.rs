@@ -4,6 +4,7 @@
 
 mod app;
 mod i18n;
+mod logo;
 mod settings;
 mod ui;
 
@@ -63,8 +64,14 @@ fn main() -> eframe::Result {
         diagnose();
         return Ok(());
     }
+    const ICON: usize = 64;
+    let icon = egui::IconData { rgba: logo::rgba(ICON, true), width: ICON as u32, height: ICON as u32 };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("SeDiR").with_inner_size([1400.0, 880.0]).with_min_inner_size([900.0, 560.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_title("SeDiR")
+            .with_inner_size([1400.0, 900.0])
+            .with_min_inner_size([900.0, 560.0])
+            .with_icon(icon),
         ..Default::default()
     };
     eframe::run_native("SeDiR", options, Box::new(|cc| Ok(Box::new(app::SedirApp::new(cc)))))

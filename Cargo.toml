@@ -6,6 +6,7 @@ license = "GPL-3.0-or-later"
 description = "Wideband SDR receiver: spectrum, waterfall and click-to-listen demodulation"
 
 [dependencies]
+cpal = "0.18.2"
 eframe = "0.35.0"
 libloading = "0.9.0"
 num-complex = "0.4"

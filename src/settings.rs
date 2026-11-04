@@ -13,6 +13,12 @@ pub struct Settings {
     pub frequency_hz: Option<f64>,
     pub network_devices: Vec<String>,
     pub threshold_db: Option<f32>,
+    /// Demodulation mode name ("NFM", …).
+    pub mode: Option<String>,
+    /// Playback device id; None for the system default.
+    pub audio_device: Option<String>,
+    /// Volume in percent.
+    pub volume: Option<f32>,
 }
 
 fn path() -> Option<PathBuf> {
@@ -38,6 +44,9 @@ impl Settings {
                 "frequency_hz" => s.frequency_hz = value.parse().ok(),
                 "network_device" if !value.is_empty() => s.network_devices.push(value.to_string()),
                 "threshold_db" => s.threshold_db = value.parse().ok(),
+                "mode" if !value.is_empty() => s.mode = Some(value.to_string()),
+                "audio_device" if !value.is_empty() => s.audio_device = Some(value.to_string()),
+                "volume" => s.volume = value.parse().ok(),
                 _ => {}
             }
         }
@@ -60,6 +69,15 @@ impl Settings {
         }
         if let Some(t) = self.threshold_db {
             out += &format!("threshold_db={t}\n");
+        }
+        if let Some(m) = &self.mode {
+            out += &format!("mode={m}\n");
+        }
+        if let Some(a) = &self.audio_device {
+            out += &format!("audio_device={a}\n");
+        }
+        if let Some(v) = self.volume {
+            out += &format!("volume={v}\n");
         }
         out
     }
@@ -91,6 +109,9 @@ mod tests {
             frequency_hz: Some(145_500_000.0),
             network_devices: vec!["192.168.1.47".into(), "ip:pluto.local".into()],
             threshold_db: Some(8.0),
+            mode: Some("NFM".into()),
+            audio_device: Some("wasapi:{0.0.0.00000000}.{abc}".into()),
+            volume: Some(70.0),
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
     }

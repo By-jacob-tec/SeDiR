@@ -9,8 +9,11 @@ use std::ffi::{CStr, CString, c_char, c_uint, c_void};
 use libloading::Library;
 use num_complex::Complex;
 
-/// Number of samples read per transfer.
-const BUFFER_SAMPLES: usize = 131_072;
+/// Samples per transfer: about 40 ms of signal. Over the network every transfer is a
+/// round trip, so high rates need large buffers to keep up.
+fn buffer_samples(rate: f64) -> usize {
+    ((rate * 0.04) as usize).next_power_of_two().clamp(65_536, 1 << 20)
+}
 /// The AD9361 ADC is 12-bit; samples arrive in the ±2048 range.
 const FULL_SCALE: f32 = 2048.0;
 /// Network and USB operations give up after this long (ms).
@@ -170,8 +173,10 @@ pub struct IioRadio {
     rx: Ptr,
     i: Ptr,
     q: Ptr,
-    /// Created on the first read, so that settings made before it apply to the first block.
+    /// Created on the first read, so that settings made before it apply to the first block;
+    /// made again when the sample rate changes (its size follows the rate).
     buffer: Ptr,
+    rate: f64,
     pending: Vec<Complex<f32>>,
     position: usize,
 }
@@ -203,7 +208,7 @@ impl IioRadio {
                 (api.context_destroy)(context);
                 return Err(format!("{uri}: receiver channels not found"));
             }
-            Ok(Self { api, context, rx_config, rx_lo, rx, i, q, buffer: std::ptr::null_mut(), pending: Vec::new(), position: 0 })
+            Ok(Self { api, context, rx_config, rx_lo, rx, i, q, buffer: std::ptr::null_mut(), rate: 2.4e6, pending: Vec::new(), position: 0 })
         }
     }
 
@@ -230,7 +235,13 @@ impl IioRadio {
     pub fn set_sample_rate(&mut self, rate: f64) -> Result<(), String> {
         self.write(self.rx_config, "sampling_frequency", &format!("{}", rate.round() as i64))?;
         let bandwidth = rate.clamp(200_000.0, 56_000_000.0);
-        self.write(self.rx_config, "rf_bandwidth", &format!("{}", bandwidth.round() as i64))
+        self.write(self.rx_config, "rf_bandwidth", &format!("{}", bandwidth.round() as i64))?;
+        if buffer_samples(rate) != buffer_samples(self.rate) && !self.buffer.is_null() {
+            unsafe { (self.api.buffer_destroy)(self.buffer) };
+            self.buffer = std::ptr::null_mut();
+        }
+        self.rate = rate;
+        Ok(())
     }
 
     /// `None` for automatic gain (slow AGC), otherwise a fixed gain in dB.
@@ -251,7 +262,7 @@ impl IioRadio {
                 if self.buffer.is_null() {
                     (self.api.channel_enable)(self.i);
                     (self.api.channel_enable)(self.q);
-                    self.buffer = (self.api.create_buffer)(self.rx, BUFFER_SAMPLES, false);
+                    self.buffer = (self.api.create_buffer)(self.rx, buffer_samples(self.rate), false);
                     if self.buffer.is_null() {
                         return Err("could not create the sample buffer".into());
                     }
