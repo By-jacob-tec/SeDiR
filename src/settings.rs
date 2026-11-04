@@ -29,6 +29,9 @@ pub struct Settings {
     pub correction_hz: Option<f64>,
     /// Whether the QO-100 beacon corrects the LO.
     pub beacon_lock: Option<bool>,
+    /// FT8 decoding on, and its dial frequency (radio frequency, Hz).
+    pub ft8_on: Option<bool>,
+    pub ft8_dial_hz: Option<f64>,
 }
 
 fn path() -> Option<PathBuf> {
@@ -62,6 +65,8 @@ impl Settings {
                 "lo_hz" => s.lo_hz = value.parse().ok(),
                 "correction_hz" => s.correction_hz = value.parse().ok(),
                 "beacon_lock" => s.beacon_lock = value.parse().ok(),
+                "ft8_on" => s.ft8_on = value.parse().ok(),
+                "ft8_dial_hz" => s.ft8_dial_hz = value.parse().ok(),
                 _ => {}
             }
         }
@@ -109,6 +114,12 @@ impl Settings {
         if let Some(b) = self.beacon_lock {
             out += &format!("beacon_lock={b}\n");
         }
+        if let Some(f) = self.ft8_on {
+            out += &format!("ft8_on={f}\n");
+        }
+        if let Some(d) = self.ft8_dial_hz {
+            out += &format!("ft8_dial_hz={d}\n");
+        }
         out
     }
 
@@ -147,6 +158,8 @@ mod tests {
             lo_hz: Some(9_750e6),
             correction_hz: Some(3_012.5),
             beacon_lock: Some(true),
+            ft8_on: Some(true),
+            ft8_dial_hz: Some(10_489.54e6),
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
     }

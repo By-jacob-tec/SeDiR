@@ -11,6 +11,7 @@ pub mod detect;
 pub mod device;
 pub mod dsp;
 pub mod freq;
+pub mod ft8;
 pub mod iio;
 pub mod listen;
 pub mod radio;
