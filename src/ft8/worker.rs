@@ -33,8 +33,14 @@ const MAX_FOLLOW_HZ: f64 = 2_000.0;
 const MAX_TIME_JUMP_S: f64 = 2.0;
 /// Weight of each block's clock reading in the buffer's start time.
 const TIME_FOLLOW: f64 = 0.01;
-/// Limits of the learned delay of the signals (satellite path, receiver buffering).
-const DELAY_RANGE_S: (f64, f64) = (-1.0, 2.5);
+/// Limits of the learned delay of the signals (satellite path, receiver buffering, and
+/// the computer clock's own error: on QO-100 most senders showed up 1 s early, likely
+/// a clock set from GPS sentences without the pulse).
+const DELAY_RANGE_S: (f64, f64) = (-2.0, 2.0);
+/// Decodes the delay is the median of (senders' own clock errors of ±1 s average out
+/// only over many), and how many are needed before it is used.
+const DELAY_FROM: usize = 40;
+const DELAY_AFTER: usize = 5;
 
 /// One decoded message.
 #[derive(Clone, Debug, PartialEq)]
@@ -69,6 +75,9 @@ pub struct Ft8 {
     dial: Arc<Mutex<Option<f64>>>,
     messages: Arc<Mutex<Vec<Ft8Message>>>,
     status: Arc<Mutex<Ft8Status>>,
+    /// Start times of recent decodes against the computer's clock (DT plus the delay
+    /// in use then), for learning the delay.
+    starts: Arc<Mutex<VecDeque<f64>>>,
 }
 
 fn now_utc() -> f64 {
@@ -233,8 +242,9 @@ fn run(blocks: Receiver<Block>, me: Ft8) {
             continue;
         }
         decoded_slot = Some(slot as u64);
-        let first = ((slot + delay - buffer_start) * RATE).round() as isize;
-        let count = (DECODE_AT_S * RATE) as usize;
+        // From EARLY_S before the slot, for senders whose clocks run ahead.
+        let first = ((slot + delay - decode::EARLY_S - buffer_start) * RATE).round() as isize;
+        let count = ((decode::EARLY_S + DECODE_AT_S) * RATE) as usize;
         // Slot samples; missing ones (before the buffer began) are zero.
         let samples: Vec<Complex<f32>> = (0..count as isize)
             .map(|i| {
@@ -242,7 +252,9 @@ fn run(blocks: Receiver<Block>, me: Ft8) {
                 if k >= 0 && (k as usize) < buffer.len() { buffer[k as usize] } else { Complex::default() }
             })
             .collect();
-        let coverage = (count as isize - (-first).max(0)).max(0) as f64 / RATE;
+        // Seconds of the slot itself (from its start) that arrived.
+        let missing = ((-first).max(0) as f64 / RATE - decode::EARLY_S).max(0.0);
+        let coverage = DECODE_AT_S - missing;
         if coverage < START_SECONDS + 12.0 {
             // Not enough of the slot to hold a whole transmission.
             continue;
@@ -250,6 +262,7 @@ fn run(blocks: Receiver<Block>, me: Ft8) {
         let (me2, book2) = (me.clone(), book.clone());
         let slot_secs = slot as u64;
         thread::spawn(move || {
+            save_slot(&samples, slot_secs);
             let lo = AUDIO_RANGE_HZ.0 - CENTER_ABOVE_DIAL_HZ;
             let hi = AUDIO_RANGE_HZ.1 - CENTER_ABOVE_DIAL_HZ;
             let found = decode::decode_slot(&samples, lo, hi, &mut book2.lock().unwrap());
@@ -266,19 +279,61 @@ fn run(blocks: Receiver<Block>, me: Ft8) {
             let excess = messages.len().saturating_sub(KEEP_MESSAGES);
             messages.drain(..excess);
             drop(messages);
+            // Learn the delay from where the decoded transmissions began, against the
+            // clock: the median over many decodes (one sender's clock error must not
+            // move it).
+            let mut starts = me2.starts.lock().unwrap();
+            starts.extend(found.iter().map(|d| d.dt_s as f64 + delay));
+            while starts.len() > DELAY_FROM {
+                starts.pop_front();
+            }
+            let learned = (starts.len() >= DELAY_AFTER).then(|| {
+                let mut sorted: Vec<f64> = starts.iter().copied().collect();
+                sorted.sort_by(f64::total_cmp);
+                sorted[sorted.len() / 2].clamp(DELAY_RANGE_S.0, DELAY_RANGE_S.1)
+            });
+            drop(starts);
             let mut status = me2.status.lock().unwrap();
-            // Learn the delay from where the decoded transmissions began: the median DT
-            // of the slot moves it most of the way (senders' own clock errors average out).
-            let mut dts: Vec<f64> = found.iter().map(|d| d.dt_s as f64).collect();
-            dts.sort_by(f64::total_cmp);
-            if let Some(&median) = dts.get(dts.len() / 2) {
-                status.delay_s = (status.delay_s + 0.7 * median).clamp(DELAY_RANGE_S.0, DELAY_RANGE_S.1);
+            if let Some(d) = learned {
+                status.delay_s = d;
             }
             status.last_slot = Some(slot_secs);
             status.last_count = found.len();
             status.coverage_s = coverage;
         });
     }
+}
+
+/// Slots kept on disk for diagnosis.
+const KEEP_SLOTS: usize = 10;
+
+/// Folder of the saved slots (Windows: %LOCALAPPDATA%\SeDiR\ft8).
+pub fn slot_dir() -> Option<std::path::PathBuf> {
+    crate::classify::analysis_dir().and_then(|d| d.parent().map(|p| p.join("ft8")))
+}
+
+/// Writes a slot's baseband (cf32 at RATE, the dial 1600 Hz below its centre) so that
+/// missed decodes can be studied; the oldest beyond `KEEP_SLOTS` are removed.
+fn save_slot(samples: &[Complex<f32>], slot: u64) {
+    let Some(dir) = slot_dir() else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let bytes: Vec<u8> = samples.iter().flat_map(|z| [z.re.to_le_bytes(), z.im.to_le_bytes()].concat()).collect();
+    let _ = std::fs::write(dir.join(format!("{slot}.cf32")), bytes);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut files: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "cf32")).collect();
+        files.sort();
+        for old in files.iter().take(files.len().saturating_sub(KEEP_SLOTS)) {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+}
+
+/// Reads a slot saved by `save_slot`.
+pub fn load_slot(path: &std::path::Path) -> Option<Vec<Complex<f32>>> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(bytes.chunks_exact(8).map(|c| Complex::new(f32::from_le_bytes(c[0..4].try_into().unwrap()), f32::from_le_bytes(c[4..8].try_into().unwrap()))).collect())
 }
 
 /// Usual FT8 dial frequencies (Hz).
@@ -337,17 +392,30 @@ mod tests {
         // As the window does: the dial follows the beacon correction every second.
         let seconds: u64 = std::env::var("SEDIR_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
         let mut last_slot = None;
-        for _ in 0..seconds {
-            let c = state.lock().unwrap().correction_hz.unwrap_or(correction);
+        for _ in 0..seconds * 10 {
+            let b = *state.lock().unwrap();
+            let c = b.correction_at(std::time::Instant::now()).unwrap_or(correction);
             ft8.set_dial(Some(10_489.540e6 - lo - c));
-            thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(100));
             let s = ft8.status();
             if s.last_slot != last_slot {
                 last_slot = s.last_slot;
-                println!("slot {:?}: {} messages, {:.1} s arrived, delay {:+.2} s, LNB {c:+.0} Hz", s.last_slot.map(|v| v % 86_400), s.last_count, s.coverage_s, s.delay_s);
+                println!(
+                    "slot {:?}: {} messages, {:.1} s arrived, delay {:+.2} s, LNB {c:+.0} Hz drifting {:+.2} Hz/s",
+                    s.last_slot.map(|v| v % 86_400),
+                    s.last_count,
+                    s.coverage_s,
+                    s.delay_s,
+                    b.rate_hz_per_s
+                );
             }
         }
         println!("{:?}", ft8.status());
+        for e in handle.events.try_iter() {
+            if let crate::source::Event::Stats(s) = e {
+                println!("{s:?}");
+            }
+        }
         for m in ft8.messages() {
             println!("{} {:+3.0} {:+.1} {:4.0}  {}", m.slot % 86_400, m.snr_db, m.dt_s, m.audio_hz, m.text);
         }
@@ -360,7 +428,7 @@ mod tests {
         let center_rf = 100e6;
         let dial = center_rf + 300e3;
         // Build the FT8 baseband at RATE, then put it up into the wide band.
-        let n = (14.0 * RATE) as usize;
+        let n = crate::ft8::decode::tests::slot_len();
         let mut base = noise(n, 0.05, 3);
         add_signal(&mut base, "CQ TA4SO KM46", 1500.0 - CENTER_ABOVE_DIAL_HZ, 0.5, amplitude(0.0) * 0.05);
         let up = (rate / RATE) as usize;

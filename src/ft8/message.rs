@@ -62,6 +62,11 @@ fn field(bits: &[u8], start: usize, len: usize) -> u64 {
     bits[start..start + len].iter().fold(0u64, |v, &b| (v << 1) | b as u64)
 }
 
+/// As `field`, for fields longer than 64 bits (free text and telemetry use 71).
+fn wide_field(bits: &[u8], start: usize, len: usize) -> u128 {
+    bits[start..start + len].iter().fold(0u128, |v, &b| (v << 1) | b as u128)
+}
+
 /// A 28-bit call sign field; None if malformed.
 fn unpack28(n28: u32, book: &CallBook) -> Option<String> {
     if n28 < NTOKENS {
@@ -133,7 +138,7 @@ pub fn unpack(bits: &[u8], book: &mut CallBook) -> Option<String> {
     let text = match (i3, n3) {
         (0, 0) => {
             // Free text: 71 bits, 13 characters in base 42.
-            let mut v = field(bits, 0, 71) as u128;
+            let mut v = wide_field(bits, 0, 71);
             let mut chars = [b' '; 13];
             for c in chars.iter_mut().rev() {
                 *c = TEXT_CHARS[(v % 42) as usize];
@@ -165,7 +170,7 @@ pub fn unpack(bits: &[u8], book: &mut CallBook) -> Option<String> {
         }
         (0, 5) => {
             // Telemetry: 71 bits as 18 hex digits.
-            let v = field(bits, 0, 71);
+            let v = wide_field(bits, 0, 71);
             format!("{v:018X}").trim_start_matches('0').to_string()
         }
         (1, _) | (2, _) => {
@@ -377,6 +382,9 @@ mod tests {
         let mut book = CallBook::default();
         let bits = pack_text("TNX QSO 73").unwrap();
         assert_eq!(unpack(&bits, &mut book).as_deref(), Some("TNX QSO 73"));
+        // All 13 characters used: the value needs all 71 bits (once lost above 64 bits).
+        let bits = pack_text("ZZZZZZZZZZZZZ").unwrap();
+        assert_eq!(unpack(&bits, &mut book).as_deref(), Some("ZZZZZZZZZZZZZ"));
     }
 
     #[test]

@@ -23,8 +23,14 @@ const TRACK_HZ: f64 = 1.5e3;
 const MIN_SNR_DB: f32 = 15.0;
 /// Measurement length (seconds of signal): long enough for both keying tones to show.
 const MEASURE_SECONDS: f64 = 2.0;
-/// Measurements whose median gives the correction.
-const MEDIAN_OF: usize = 5;
+/// Measurements a straight line is fitted to (~12 s): the LNB drifts steadily (2.8 Hz/s
+/// seen while warming up), so the correction is given as a value and a rate, and users
+/// follow it smoothly instead of in 2 s steps (which made FT8 tones jump).
+const FIT_OF: usize = 6;
+/// A measurement this far from the fitted line is set aside (a wrong tone, a burst).
+const OUTLIER_HZ: f64 = 40.0;
+/// Drift rates beyond this are not believed (Hz/s).
+const MAX_RATE: f64 = 20.0;
 /// FFT size at the ~40 kHz analysis rate: ~5 Hz bins.
 const FFT_SIZE: usize = 8192;
 
@@ -43,10 +49,33 @@ pub enum BeaconStatus {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BeaconState {
-    /// Correction to add to the converter LO (Hz); None until the first lock.
+    /// Correction to add to the converter LO (Hz) at the time `updated`; None until the
+    /// first lock.
     pub correction_hz: Option<f64>,
+    /// How fast the correction changes (Hz/s).
+    pub rate_hz_per_s: f64,
     pub status: BeaconStatus,
     pub updated: Option<Instant>,
+}
+
+impl BeaconState {
+    /// The correction at `now`, carried along the measured drift.
+    pub fn correction_at(&self, now: Instant) -> Option<f64> {
+        let c = self.correction_hz?;
+        let dt = self.updated.map_or(0.0, |u| now.saturating_duration_since(u).as_secs_f64());
+        Some(c + self.rate_hz_per_s * dt)
+    }
+}
+
+/// Straight line through (seconds, Hz) points: (value at the last point's time, slope).
+fn fit_line(points: &[(f64, f64)]) -> (f64, f64) {
+    let n = points.len() as f64;
+    let (mx, my) = (points.iter().map(|p| p.0).sum::<f64>() / n, points.iter().map(|p| p.1).sum::<f64>() / n);
+    let sxx: f64 = points.iter().map(|p| (p.0 - mx).powi(2)).sum();
+    let sxy: f64 = points.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+    let slope = if sxx > 1e-9 { (sxy / sxx).clamp(-MAX_RATE, MAX_RATE) } else { 0.0 };
+    let last = points.last().map_or(mx, |p| p.0);
+    (my + slope * (last - mx), slope)
 }
 
 pub type SharedBeacon = Arc<Mutex<BeaconState>>;
@@ -123,7 +152,11 @@ pub fn find_beacon(db: &[f32], rate: f64, window_hz: f64) -> Option<(f64, f32)> 
 
 fn run(blocks: Receiver<Block>, beacon_hz: f64, lo_hz: f64, mut correction: f64, state: SharedBeacon) {
     let mut locked = false;
-    let mut recent: Vec<f64> = Vec::new();
+    // (signal time at the middle of the measurement, measured correction).
+    let mut points: Vec<(f64, f64)> = Vec::new();
+    let mut outliers = 0;
+    // Seconds of signal processed: the time axis of the drift (the blocks' own clock).
+    let mut signal_time = 0.0f64;
     // Receiver frequency where the beacon is expected.
     let expected = |correction: f64| beacon_hz - lo_hz - correction;
     let mut chain: Option<(f64, f64, f64, Mixer, Vec<FirDecimator<Complex<f32>>>, f64)> = None;
@@ -163,10 +196,13 @@ fn run(blocks: Receiver<Block>, beacon_hz: f64, lo_hz: f64, mut correction: f64,
             std::mem::swap(&mut a, &mut b);
         }
         spectrum.push(&a);
-        collected += a.len() as f64 / *rate;
+        let seconds = a.len() as f64 / *rate;
+        collected += seconds;
+        signal_time += seconds;
         if collected < MEASURE_SECONDS {
             continue;
         }
+        let middle = signal_time - collected / 2.0;
         collected = 0.0;
         let Some(db) = spectrum.take() else { continue };
         let window = if locked { TRACK_HZ } else { SEARCH_HZ };
@@ -174,24 +210,43 @@ fn run(blocks: Receiver<Block>, beacon_hz: f64, lo_hz: f64, mut correction: f64,
         match find_beacon(&db, *rate, window) {
             Some((offset, snr)) => {
                 // The beacon sits `offset` above where it was expected: the LO is that
-                // much lower than assumed, so the correction falls by it. The median of
-                // the last measurements is used, so one bad measurement cannot pull it.
-                recent.push(correction - offset);
-                if recent.len() > MEDIAN_OF {
-                    recent.remove(0);
+                // much lower than assumed, so the correction falls by it.
+                let measured = correction - offset;
+                // A measurement far off the line so far is set aside (three in a row
+                // mean the line itself is wrong: start a new one).
+                if points.len() >= 3 {
+                    let (value, slope) = fit_line(&points);
+                    let predicted = value + slope * (middle - points.last().map_or(middle, |p| p.0));
+                    if (measured - predicted).abs() > OUTLIER_HZ {
+                        outliers += 1;
+                        if outliers < 3 {
+                            continue;
+                        }
+                        points.clear();
+                    }
                 }
-                let mut sorted = recent.clone();
-                sorted.sort_by(f64::total_cmp);
-                correction = sorted[sorted.len() / 2];
+                outliers = 0;
+                points.push((middle, measured));
+                if points.len() > FIT_OF {
+                    points.remove(0);
+                }
+                let (value, slope) = if points.len() >= 2 { fit_line(&points) } else { (measured, 0.0) };
+                // Carried from the middle of the last measurement to now.
+                correction = value + slope * (signal_time - middle);
                 locked = true;
-                *s = BeaconState { correction_hz: Some(correction), status: BeaconStatus::Locked { snr_db: snr }, updated: Some(Instant::now()) };
+                *s = BeaconState {
+                    correction_hz: Some(correction),
+                    rate_hz_per_s: slope,
+                    status: BeaconStatus::Locked { snr_db: snr },
+                    updated: Some(Instant::now()),
+                };
             }
             None => {
                 // A measurement without the pair keeps the lock for a while.
                 if s.updated.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
                     s.status = BeaconStatus::NotFound;
                     locked = false;
-                    recent.clear();
+                    points.clear();
                 }
             }
         }
@@ -207,6 +262,11 @@ mod tests {
     /// Receiver blocks of a band with a beacon `offset_hz` from where a correct LO would
     /// put it, a stronger CW signal 8 kHz above it, and noise.
     fn blocks(center_if: f64, rate: f64, beacon_if: f64, seconds: f64) -> Vec<Block> {
+        drifting_blocks(center_if, rate, beacon_if, 0.0, seconds)
+    }
+
+    /// As `blocks`, with the beacon moving by `drift` Hz per second (a warming LNB).
+    fn drifting_blocks(center_if: f64, rate: f64, beacon_if: f64, drift: f64, seconds: f64) -> Vec<Block> {
         let mut seed = 7u32;
         let mut noise = move || {
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -218,8 +278,10 @@ mod tests {
                 let t = i as f64 / rate;
                 // Two-tone keying like the satellite's beacon: the upper tone half the time.
                 let shift = if (t * 4.0) as u32 % 2 == 0 { 0.0 } else { 393.0 };
-                let beacon = Complex::from_polar(0.05f32, (2.0 * PI * (beacon_if - center_if) * t + 2.0 * PI * shift * t) as f32);
-                let cw = Complex::from_polar(0.2f32, (2.0 * PI * (beacon_if + 8e3 - center_if) * t) as f32);
+                // Phase of a frequency rising by `drift` Hz/s: everything moves with the LNB.
+                let moving = PI * drift * t * t;
+                let beacon = Complex::from_polar(0.05f32, (2.0 * PI * (beacon_if - center_if) * t + 2.0 * PI * shift * t + moving) as f32);
+                let cw = Complex::from_polar(0.2f32, (2.0 * PI * (beacon_if + 8e3 - center_if) * t + moving) as f32);
                 beacon + cw + Complex::new(noise(), noise()) * 0.02
             })
             .collect();
@@ -254,6 +316,33 @@ mod tests {
         assert!(matches!(s.status, BeaconStatus::Locked { .. }));
         let c = s.correction_hz.unwrap();
         assert!((c - 3_200.0).abs() < 3.0, "correction {c}");
+    }
+
+    #[test]
+    fn follows_a_drifting_lnb_as_a_line() {
+        // The beacon rises by 3 Hz/s (the LNB's oscillator falling): the correction must
+        // fall by 3 Hz/s, and be right at the end, not lag behind.
+        let lo = 9_750e6;
+        let beacon_if = QO100_BEACON_HZ - (lo + 3_200.0);
+        let seconds = 14.0;
+        let (tx, rx) = mpsc::sync_channel(2000);
+        for b in drifting_blocks(739.75e6, 2.4e6, beacon_if, 3.0, seconds) {
+            tx.send(b).unwrap();
+        }
+        drop(tx);
+        let state = spawn(rx, QO100_BEACON_HZ, lo, 0.0);
+        let started = Instant::now();
+        while Arc::strong_count(&state) > 1 && started.elapsed() < Duration::from_secs(30) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let s = *state.lock().unwrap();
+        println!("{s:?}");
+        assert!((s.rate_hz_per_s + 3.0).abs() < 0.4, "rate {}", s.rate_hz_per_s);
+        // The last whole 2 s measurement ends at 12 or 14 s (filters delay the stream a
+        // little): the correction must be on the line there, not lag it.
+        let c = s.correction_hz.unwrap();
+        let on_line = [12.0, seconds].iter().any(|t| (c - (3_200.0 - 3.0 * t)).abs() < 3.0);
+        assert!(on_line, "correction {c} is not on the drift line at 12 or 14 s");
     }
 
     /// On the satellite: `SEDIR_SOURCE=ip:192.168.1.47 cargo test --lib live_beacon -- --ignored --nocapture`

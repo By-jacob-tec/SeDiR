@@ -425,9 +425,11 @@ impl SedirApp {
             self.send(Command::Unsubscribe(BEACON_ID));
             self.beacon = None;
         }
-        let measured = self.beacon.as_ref().and_then(|b| b.lock().unwrap().correction_hz);
+        // Carried along the measured drift every frame: the correction changes smoothly,
+        // so FT8 tones and the listened signal stay put between measurements.
+        let measured = self.beacon.as_ref().and_then(|b| b.lock().unwrap().correction_at(std::time::Instant::now()));
         if let Some(c) = measured {
-            if (c - self.correction_hz).abs() > 0.5 {
+            if (c - self.correction_hz).abs() > 0.05 {
                 self.apply_correction(c);
             }
         }
@@ -893,7 +895,7 @@ impl SedirApp {
             });
         });
         let messages = self.ft8.messages();
-        egui::ScrollArea::vertical().max_height(170.0).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+        egui::ScrollArea::vertical().max_height(ui.available_height()).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
             egui::Grid::new("ft8_messages").num_columns(5).spacing(vec2(14.0, 2.0)).striped(true).show(ui, |ui| {
                 for h in ["UTC", "dB", "DT", "Hz", t.ft8_message] {
                     ui.label(RichText::new(h).size(11.0).strong().color(MUTED));
@@ -1540,7 +1542,11 @@ impl eframe::App for SedirApp {
                 .show(ui, |ui| self.rds_bar(ui));
         }
         if self.ft8_on && self.opened {
+            // Drag its top edge to make it taller.
             egui::Panel::bottom("ft8")
+                .resizable(true)
+                .default_size(230.0)
+                .size_range(110.0..=700.0)
                 .frame(egui::Frame::new().fill(CARD).inner_margin(egui::Margin::symmetric(14, 6)))
                 .show(ui, |ui| self.ft8_panel(ui));
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
