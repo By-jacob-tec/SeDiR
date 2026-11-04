@@ -25,6 +25,10 @@ pub struct Settings {
     pub auto_mode: Option<bool>,
     /// Converter local oscillator (Hz), e.g. 9750 MHz for a QO-100 LNB.
     pub lo_hz: Option<f64>,
+    /// Measured or set error of that LO (Hz).
+    pub correction_hz: Option<f64>,
+    /// Whether the QO-100 beacon corrects the LO.
+    pub beacon_lock: Option<bool>,
 }
 
 fn path() -> Option<PathBuf> {
@@ -56,6 +60,8 @@ impl Settings {
                 "find_names" => s.find_names = value.parse().ok(),
                 "auto_mode" => s.auto_mode = value.parse().ok(),
                 "lo_hz" => s.lo_hz = value.parse().ok(),
+                "correction_hz" => s.correction_hz = value.parse().ok(),
+                "beacon_lock" => s.beacon_lock = value.parse().ok(),
                 _ => {}
             }
         }
@@ -97,6 +103,12 @@ impl Settings {
         if let Some(lo) = self.lo_hz {
             out += &format!("lo_hz={lo}\n");
         }
+        if let Some(c) = self.correction_hz {
+            out += &format!("correction_hz={c}\n");
+        }
+        if let Some(b) = self.beacon_lock {
+            out += &format!("beacon_lock={b}\n");
+        }
         out
     }
 
@@ -133,6 +145,8 @@ mod tests {
             find_names: Some(false),
             auto_mode: Some(true),
             lo_hz: Some(9_750e6),
+            correction_hz: Some(3_012.5),
+            beacon_lock: Some(true),
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
     }

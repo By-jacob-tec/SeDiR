@@ -8,6 +8,7 @@ use eframe::egui::{
 };
 
 use sedir::audio::{self, AudioBuffer, AudioOutput, OutputDevice, Volume};
+use sedir::beacon::{self, BeaconStatus, QO100_BEACON_HZ, SharedBeacon};
 use sedir::classify::{self, Classification, Reason};
 use sedir::demod::Mode;
 use sedir::detect::{self, Signal};
@@ -45,6 +46,10 @@ const LISTEN_QUEUE: usize = 32;
 const SCAN_ID: u32 = 2;
 /// Subscriber id of a mode recognition job.
 const CLASSIFY_ID: u32 = 3;
+/// Subscriber id of the beacon tracker.
+const BEACON_ID: u32 = 4;
+/// Converter LO of a QO-100 LNB: the beacon can be followed with it.
+const QO100_LO_HZ: f64 = 9_750e6;
 /// Signals at least this wide and this far above the noise, inside the FM broadcast
 /// bands (OIRT 65.8–74 MHz included), are searched for RDS.
 const FM_MIN_WIDTH_HZ: f64 = 50e3;
@@ -86,6 +91,11 @@ pub struct SedirApp {
     /// radio frequency = receiver frequency + this. 0 without one; negative for an
     /// up-converter.
     lo_hz: f64,
+    /// Error of that LO (Hz), measured on a beacon or set by hand: the effective LO is
+    /// `lo_hz + correction_hz`.
+    correction_hz: f64,
+    beacon_lock: bool,
+    beacon: Option<SharedBeacon>,
     sample_rate: f64,
     gain_db: f64,
     auto_gain: bool,
@@ -140,8 +150,14 @@ impl SedirApp {
         let logo = ColorImage::from_rgba_unmultiplied([LOGO_PIXELS, LOGO_PIXELS], &crate::logo::rgba(LOGO_PIXELS, false));
         let find_names = settings.find_names.unwrap_or(true);
         let lo_hz = settings.lo_hz.unwrap_or(0.0);
+        let correction_hz = settings.correction_hz.unwrap_or(0.0);
+        let beacon_lock = settings.beacon_lock.unwrap_or(true);
+        let auto_mode = settings.auto_mode.unwrap_or(true);
         let mut app = Self {
-            auto_mode: settings.auto_mode.unwrap_or(true),
+            correction_hz,
+            beacon_lock,
+            beacon: None,
+            auto_mode,
             classifying: None,
             classification: None,
             stations: Stations::new(find_names),
@@ -258,8 +274,8 @@ impl SedirApp {
     fn frequency_note(&self, hz: f64) -> Result<Option<(String, Color32)>, (String, Color32)> {
         let t = self.t();
         let name = self.device().map_or(DeviceKind::Other.name(), |d| d.kind.name());
-        let (lo, hi) = (freq::short(self.limits.min_hz + self.lo_hz), freq::short(self.limits.max_hz + self.lo_hz));
-        match self.limits.check(hz - self.lo_hz) {
+        let (lo, hi) = (freq::short(self.limits.min_hz + self.lo()), freq::short(self.limits.max_hz + self.lo()));
+        match self.limits.check(hz - self.lo()) {
             FreqCheck::Ok => Ok(None),
             FreqCheck::Weak => {
                 let below = freq::short(self.limits.weak_below_hz.unwrap_or(0.0));
@@ -301,7 +317,7 @@ impl SedirApp {
             self.entry_note = Some(note);
             return;
         }
-        let tuning = Tuning { center_hz: self.center_hz - self.lo_hz, sample_rate: self.sample_rate, gain: self.gain() };
+        let tuning = Tuning { center_hz: self.center_hz - self.lo(), sample_rate: self.sample_rate, gain: self.gain() };
         self.view = self.view.clamped(self.sample_rate);
         let ctx = ctx.clone();
         self.handle = Some(source::spawn(device.clone(), tuning, self.view, move || ctx.request_repaint()));
@@ -326,6 +342,7 @@ impl SedirApp {
 
     fn stop(&mut self) {
         self.handle = None;
+        self.beacon = None;
         self.opened = false;
         self.stats = Stats::default();
         self.audio_buffer.clear();
@@ -363,11 +380,53 @@ impl SedirApp {
         self.settings.save();
     }
 
+    /// Effective converter LO: nominal plus the measured or set error.
+    fn lo(&self) -> f64 {
+        self.lo_hz + self.correction_hz
+    }
+
+    /// Takes a new LO correction. The receiver stays where it is, so the signal being
+    /// listened to stays; only the radio frequencies shown move to their true values.
+    fn apply_correction(&mut self, correction: f64) {
+        let shift = correction - self.correction_hz;
+        self.correction_hz = correction;
+        self.center_hz += shift;
+        self.vfo_hz += shift;
+        // Kept so the next start begins close; saved only on real changes.
+        if (self.settings.correction_hz.unwrap_or(0.0) - correction).abs() > 20.0 {
+            self.settings.correction_hz = Some(correction);
+            self.settings.save();
+        }
+    }
+
+    /// Follows the QO-100 beacon while running with the QO-100 LNB and the lock on.
+    fn update_beacon_tracker(&mut self) {
+        let wanted = self.beacon_lock && self.lo_hz == QO100_LO_HZ && self.handle.is_some();
+        if wanted && self.beacon.is_none() {
+            let (tx, rx) = mpsc::sync_channel(LISTEN_QUEUE);
+            self.send(Command::Subscribe(BEACON_ID, tx));
+            self.beacon = Some(beacon::spawn(rx, QO100_BEACON_HZ, self.lo_hz, self.correction_hz));
+        } else if !wanted && self.beacon.is_some() {
+            self.send(Command::Unsubscribe(BEACON_ID));
+            self.beacon = None;
+        }
+        let measured = self.beacon.as_ref().and_then(|b| b.lock().unwrap().correction_hz);
+        if let Some(c) = measured {
+            if (c - self.correction_hz).abs() > 0.5 {
+                self.apply_correction(c);
+            }
+        }
+    }
+
     /// Changes the converter LO. The receiver stays tuned where it is; the radio
     /// frequencies shown move with the LO.
     fn set_converter(&mut self, lo: f64) {
         let shift = lo - self.lo_hz;
         self.lo_hz = lo;
+        // A tracker follows one LO; it starts again for the new one.
+        if self.beacon.take().is_some() {
+            self.send(Command::Unsubscribe(BEACON_ID));
+        }
         self.center_hz += shift;
         self.vfo_hz += shift;
         self.frame = None;
@@ -389,7 +448,7 @@ impl SedirApp {
             // Replaces a job still running: its channel closes and it stops.
             self.send(Command::Subscribe(CLASSIFY_ID, tx));
             let width = signal.map_or(3e3, |s| s.bandwidth_hz);
-            self.classifying = Some(classify::spawn_job(rx, target - self.lo_hz, width, self.lo_hz));
+            self.classifying = Some(classify::spawn_job(rx, target - self.lo(), width, self.lo()));
             self.classification = None;
         } else {
             let hz = match signal {
@@ -416,7 +475,7 @@ impl SedirApp {
     /// Hands the current listening settings to the demodulator thread.
     fn sync_listener(&self) {
         let squelch = self.squelch_on.then_some(self.squelch_db);
-        let (frequency, mode, bandwidth) = (self.vfo_hz - self.lo_hz, self.mode, self.bandwidth_hz);
+        let (frequency, mode, bandwidth) = (self.vfo_hz - self.lo(), self.mode, self.bandwidth_hz);
         self.listener.update(|s| {
             s.frequency_hz = frequency;
             s.mode = mode;
@@ -484,7 +543,7 @@ impl SedirApp {
             Ok(note) => {
                 self.entry_note = note;
                 self.center_hz = hz.round();
-                self.send(Command::Tune(self.center_hz - self.lo_hz));
+                self.send(Command::Tune(self.center_hz - self.lo()));
                 true
             }
         }
@@ -533,10 +592,10 @@ impl SedirApp {
     fn push_frame(&mut self, frame: Frame) {
         // The source works in the receiver's own frequencies; the window in radio frequencies.
         let info = FrameInfo {
-            center_hz: frame.center_hz + self.lo_hz,
+            center_hz: frame.center_hz + self.lo(),
             sample_rate: frame.sample_rate,
-            lo_hz: frame.lo_hz + self.lo_hz,
-            hi_hz: frame.hi_hz + self.lo_hz,
+            lo_hz: frame.lo_hz + self.lo(),
+            hi_hz: frame.hi_hz + self.lo(),
             bin_hz: frame.bin_hz,
             points: frame.db.len(),
         };
@@ -602,7 +661,7 @@ impl SedirApp {
                 .collect();
             fm.sort_by(|a, b| b.snr_db.total_cmp(&a.snr_db));
             // The scanner and the name store work in the receiver's frequencies.
-            self.stations.set_targets(fm.iter().map(|s| s.center_hz - self.lo_hz).collect());
+            self.stations.set_targets(fm.iter().map(|s| s.center_hz - self.lo()).collect());
         }
     }
 
@@ -907,6 +966,34 @@ impl SedirApp {
                 self.set_converter(lo);
             }
         });
+        if self.lo_hz != 0.0 {
+            ui.horizontal(|ui| {
+                ui.label(t.correction).on_hover_text(t.correction_tooltip);
+                let mut khz = self.correction_hz / 1e3;
+                let locked = self.beacon_lock && self.lo_hz == QO100_LO_HZ;
+                let edit = egui::DragValue::new(&mut khz).speed(0.01).suffix(" kHz").max_decimals(3);
+                if ui.add_enabled(!locked, edit).changed() {
+                    self.apply_correction(khz * 1e3);
+                    self.settings.correction_hz = Some(self.correction_hz);
+                    self.settings.save();
+                }
+            });
+        }
+        if self.lo_hz == QO100_LO_HZ {
+            if ui.checkbox(&mut self.beacon_lock, t.beacon_lock).on_hover_text(t.beacon_tooltip).changed() {
+                self.settings.beacon_lock = Some(self.beacon_lock);
+                self.settings.save();
+            }
+            if let Some(b) = &self.beacon {
+                let (text, color) = match b.lock().unwrap().status {
+                    BeaconStatus::Searching => (t.beacon_searching.to_string(), MUTED),
+                    BeaconStatus::Locked { snr_db } => (fill(t.beacon_locked, &[&format!("{snr_db:.0}")]), GOOD),
+                    BeaconStatus::NotFound => (t.beacon_not_found.to_string(), WARN),
+                    BeaconStatus::OutsideBand => (t.beacon_outside.to_string(), WARN),
+                };
+                ui.label(RichText::new(text).size(12.0).color(color));
+            }
+        }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(t.step);
@@ -992,7 +1079,7 @@ impl SedirApp {
                     for s in &self.signals {
                         let selected = (self.vfo_hz - s.center_hz).abs() <= s.bandwidth_hz / 2.0;
                         let mut text = format!("{:.3}  ·  {}  ·  {:.0} dB", s.center_hz / 1e6, freq::width(s.bandwidth_hz), s.snr_db);
-                        if let Some(name) = self.stations.name_near(s.center_hz - self.lo_hz) {
+                        if let Some(name) = self.stations.name_near(s.center_hz - self.lo()) {
                             text = format!("{name}  ·  {text}");
                         }
                         let text = RichText::new(text).monospace().size(12.0);
@@ -1102,7 +1189,7 @@ impl SedirApp {
         let mut placed: Vec<Rect> = Vec::new();
         let mut named: Vec<(&Signal, f64, String)> = Vec::new();
         for s in &self.signals {
-            let Some((station, name)) = self.stations.station_near(s.center_hz - self.lo_hz) else { continue };
+            let Some((station, name)) = self.stations.station_near(s.center_hz - self.lo()) else { continue };
             // One label per station, on its strongest signal.
             match named.iter_mut().find(|(_, f, _)| *f == station) {
                 Some(entry) if entry.0.snr_db < s.snr_db => entry.0 = s,
@@ -1284,6 +1371,7 @@ impl eframe::App for SedirApp {
         self.poll_discovery();
         self.poll_events();
         self.poll_classification();
+        self.update_beacon_tracker();
         self.sync_listener();
         if self.handle.is_some() {
             // Keeps the signal meter moving between spectrum frames.

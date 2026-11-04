@@ -139,6 +139,14 @@ pub struct Strings {
     pub converter_none: &'static str,
     pub converter_qo100: &'static str,
     pub converter_upconverter: &'static str,
+    pub correction: &'static str,
+    pub correction_tooltip: &'static str,
+    pub beacon_lock: &'static str,
+    pub beacon_tooltip: &'static str,
+    pub beacon_searching: &'static str,
+    pub beacon_locked: &'static str,
+    pub beacon_not_found: &'static str,
+    pub beacon_outside: &'static str,
 }
 
 pub static EN: Strings = Strings {
@@ -233,6 +241,14 @@ pub static EN: Strings = Strings {
     converter_none: "None",
     converter_qo100: "QO-100 LNB (9750 MHz)",
     converter_upconverter: "HF up-converter (125 MHz)",
+    correction: "Correction",
+    correction_tooltip: "Error of the converter's oscillator. Set by hand, or measured on the beacon when the lock is on.",
+    beacon_lock: "Lock to the beacon (10489.500)",
+    beacon_tooltip: "Measures the QO-100 lower CW beacon every second and corrects the LNB's frequency error and drift. The signal being listened to stays; the frequencies shown move to their true values.",
+    beacon_searching: "Looking for the beacon…",
+    beacon_locked: "Locked · {} dB",
+    beacon_not_found: "Beacon not found (too weak, or more than 15 kHz off?)",
+    beacon_outside: "The beacon is outside the received band",
 };
 
 pub static TR: Strings = Strings {
@@ -327,6 +343,14 @@ pub static TR: Strings = Strings {
     converter_none: "Yok",
     converter_qo100: "QO-100 LNB (9750 MHz)",
     converter_upconverter: "HF yukarı dönüştürücü (125 MHz)",
+    correction: "Düzeltme",
+    correction_tooltip: "Dönüştürücü osilatörünün hatası. Elle girilir ya da kilit açıkken beacon'da ölçülür.",
+    beacon_lock: "Beacon'a kilitle (10489.500)",
+    beacon_tooltip: "QO-100 alt CW beacon'ını her saniye ölçer, LNB'nin frekans hatasını ve kaymasını düzeltir. Dinlenen sinyal yerinde kalır; gösterilen frekanslar gerçek değerlerine kayar.",
+    beacon_searching: "Beacon aranıyor…",
+    beacon_locked: "Kilitli · {} dB",
+    beacon_not_found: "Beacon bulunamadı (çok zayıf ya da 15 kHz'ten fazla kayık?)",
+    beacon_outside: "Beacon alınan bandın dışında",
 };
 
 #[cfg(test)]
