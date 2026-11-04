@@ -1,0 +1,221 @@
+//! Interface texts in English and Turkish.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lang {
+    En,
+    Tr,
+}
+
+impl Lang {
+    pub const ALL: [Lang; 2] = [Lang::En, Lang::Tr];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Lang::En => "en",
+            Lang::Tr => "tr",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|l| code.trim().eq_ignore_ascii_case(l.code()))
+    }
+
+    pub fn native_name(self) -> &'static str {
+        match self {
+            Lang::En => "English",
+            Lang::Tr => "Türkçe",
+        }
+    }
+
+    /// Turkish if the operating system's language is Turkish, otherwise English.
+    pub fn from_system() -> Self {
+        match sys_locale::get_locale() {
+            Some(l) if l.to_ascii_lowercase().starts_with("tr") => Lang::Tr,
+            _ => Lang::En,
+        }
+    }
+
+    pub fn strings(self) -> &'static Strings {
+        match self {
+            Lang::En => &EN,
+            Lang::Tr => &TR,
+        }
+    }
+}
+
+/// Replaces each `{}` in `template` with the next value.
+pub fn fill(template: &str, values: &[&dyn std::fmt::Display]) -> String {
+    let mut out = String::with_capacity(template.len() + 16);
+    let mut parts = template.split("{}");
+    if let Some(first) = parts.next() {
+        out.push_str(first);
+    }
+    for (i, part) in parts.enumerate() {
+        if let Some(v) = values.get(i) {
+            out.push_str(&v.to_string());
+        }
+        out.push_str(part);
+    }
+    out
+}
+
+pub struct Strings {
+    pub app_subtitle: &'static str,
+    pub language: &'static str,
+    pub listening_caps: &'static str,
+    pub start: &'static str,
+    pub stop: &'static str,
+    pub card_receiver: &'static str,
+    pub card_frequency: &'static str,
+    pub card_view: &'static str,
+    pub searching: &'static str,
+    pub no_device: &'static str,
+    pub no_device_help: &'static str,
+    pub search_again: &'static str,
+    pub network_device: &'static str,
+    pub network_hint: &'static str,
+    pub add: &'static str,
+    pub range: &'static str,
+    pub bandwidth: &'static str,
+    pub bandwidth_tooltip: &'static str,
+    pub gain: &'static str,
+    pub auto_gain: &'static str,
+    pub freq_hint: &'static str,
+    pub tune: &'static str,
+    pub freq_entry_tooltip: &'static str,
+    pub bad_number: &'static str,
+    pub too_low: &'static str,
+    pub too_high: &'static str,
+    pub weak_range: &'static str,
+    pub step: &'static str,
+    pub span: &'static str,
+    pub full_span: &'static str,
+    pub threshold: &'static str,
+    pub threshold_tooltip: &'static str,
+    pub resolution: &'static str,
+    pub signals_caps: &'static str,
+    pub signals_none: &'static str,
+    pub signal_tooltip: &'static str,
+    pub spectrum_help: &'static str,
+    pub stopped: &'static str,
+    pub opening: &'static str,
+    pub running: &'static str,
+    pub stream: &'static str,
+    pub stream_tooltip: &'static str,
+    pub lost: &'static str,
+    pub error: &'static str,
+    pub center: &'static str,
+    pub snr_caps: &'static str,
+    pub width_caps: &'static str,
+}
+
+pub static EN: Strings = Strings {
+    app_subtitle: "Wideband SDR receiver",
+    language: "Language",
+    listening_caps: "LISTENING FREQUENCY",
+    start: "▶  Start",
+    stop: "■  Stop",
+    card_receiver: "RECEIVER",
+    card_frequency: "FREQUENCY",
+    card_view: "VIEW",
+    searching: "Searching for receivers…",
+    no_device: "No receiver found.",
+    no_device_help: "Connect an RTL-SDR, HackRF, ADALM-Pluto or LibreSDR, or add a network receiver below.",
+    search_again: "⟳  Search again",
+    network_device: "Network receiver (Pluto / LibreSDR)",
+    network_hint: "IP address, e.g. 192.168.1.47",
+    add: "Add",
+    range: "Range",
+    bandwidth: "Bandwidth",
+    bandwidth_tooltip: "Sample rate: the width of the band received at once. The highest rate the device carries without loss is chosen by default.",
+    gain: "Gain",
+    auto_gain: "Automatic",
+    freq_hint: "e.g. 145.5  ·  7074k  ·  1.09G",
+    tune: "Tune",
+    freq_entry_tooltip: "A number without a unit is read as MHz. k, M, G and Hz units are accepted.",
+    bad_number: "Could not read “{}” as a frequency.",
+    too_low: "{} is below the range of this {} ({} – {}).",
+    too_high: "{} is above the range of this {} ({} – {}).",
+    weak_range: "The {} receives {}, but poorly below {}.",
+    step: "Wheel step",
+    span: "Visible band",
+    full_span: "Full",
+    threshold: "Signal threshold",
+    threshold_tooltip: "How far above the noise floor a signal must rise to be listed.",
+    resolution: "Resolution",
+    signals_caps: "SIGNALS",
+    signals_none: "none found in the visible band",
+    signal_tooltip: "Select this signal",
+    spectrum_help: "Click: select  ·  Double-click: centre  ·  Drag: move  ·  Wheel: step  ·  Ctrl+wheel: zoom",
+    stopped: "Stopped",
+    opening: "Opening {}…",
+    running: "{} · {} at {}",
+    stream: "Stream {} ({}%)",
+    stream_tooltip: "Samples actually arriving from the device. Below 100% the connection or the computer cannot keep up: choose a narrower bandwidth.",
+    lost: "lost {}×",
+    error: "Error: {}",
+    center: "Centre",
+    snr_caps: "SNR",
+    width_caps: "WIDTH",
+};
+
+pub static TR: Strings = Strings {
+    app_subtitle: "Geniş bant SDR alıcı",
+    language: "Dil",
+    listening_caps: "DİNLEME FREKANSI",
+    start: "▶  Başlat",
+    stop: "■  Durdur",
+    card_receiver: "ALICI",
+    card_frequency: "FREKANS",
+    card_view: "GÖRÜNÜM",
+    searching: "Alıcılar aranıyor…",
+    no_device: "Alıcı bulunamadı.",
+    no_device_help: "Bir RTL-SDR, HackRF, ADALM-Pluto veya LibreSDR bağlayın ya da aşağıdan ağ alıcısı ekleyin.",
+    search_again: "⟳  Yeniden ara",
+    network_device: "Ağ alıcısı (Pluto / LibreSDR)",
+    network_hint: "IP adresi, ör. 192.168.1.47",
+    add: "Ekle",
+    range: "Aralık",
+    bandwidth: "Bant genişliği",
+    bandwidth_tooltip: "Örnekleme hızı: aynı anda alınan bandın genişliği. Varsayılan olarak cihazın kayıpsız taşıyabildiği en yüksek hız seçilir.",
+    gain: "Kazanç",
+    auto_gain: "Otomatik",
+    freq_hint: "ör. 145.5  ·  7074k  ·  1.09G",
+    tune: "Git",
+    freq_entry_tooltip: "Birimsiz sayı MHz okunur. k, M, G ve Hz birimleri kabul edilir.",
+    bad_number: "“{}” frekans olarak okunamadı.",
+    too_low: "{}, bu {} alıcısının aralığının altında ({} – {}).",
+    too_high: "{}, bu {} alıcısının aralığının üstünde ({} – {}).",
+    weak_range: "{} {} frekansını alır, ama {} altında zayıftır.",
+    step: "Tekerlek adımı",
+    span: "Görünen bant",
+    full_span: "Tamamı",
+    threshold: "Sinyal eşiği",
+    threshold_tooltip: "Bir sinyalin listelenmesi için gürültü tabanının ne kadar üstüne çıkması gerektiği.",
+    resolution: "Çözünürlük",
+    signals_caps: "SİNYALLER",
+    signals_none: "görünen bantta bulunamadı",
+    signal_tooltip: "Bu sinyali seç",
+    spectrum_help: "Tıkla: seç  ·  Çift tıkla: ortala  ·  Sürükle: kaydır  ·  Tekerlek: adım  ·  Ctrl+tekerlek: yakınlaştır",
+    stopped: "Durduruldu",
+    opening: "{} açılıyor…",
+    running: "{} · {}, {}",
+    stream: "Akış {} (%{})",
+    stream_tooltip: "Cihazdan gerçekten gelen örnekler. %100'ün altındaysa bağlantı ya da bilgisayar yetişemiyor: daha dar bir bant genişliği seçin.",
+    lost: "{} kez kayıp",
+    error: "Hata: {}",
+    center: "Ortala",
+    snr_caps: "SNR",
+    width_caps: "GENİŞLİK",
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fills_templates() {
+        assert_eq!(fill("{} is below {} ({} – {}).", &[&"7 MHz", &"RTL-SDR", &1, &2]), "7 MHz is below RTL-SDR (1 – 2).");
+        assert_eq!(fill("no values", &[]), "no values");
+    }
+}

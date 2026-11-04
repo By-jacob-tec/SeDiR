@@ -1,0 +1,963 @@
+//! The main window.
+
+use std::sync::mpsc::{self, Receiver};
+
+use eframe::egui::{
+    self, Align2, Color32, ColorImage, CornerRadius, FontId, Mesh, Pos2, Rect, RichText, Sense, Shape, Stroke, TextureHandle,
+    TextureOptions, pos2, vec2,
+};
+
+use sedir::detect::{self, Signal};
+use sedir::device::{self, DeviceInfo, DeviceKind, FreqCheck, Limits};
+use sedir::freq;
+use sedir::radio::Tuning;
+use sedir::source::{self, Command, Event, Frame, Handle, Stats, View};
+
+use crate::i18n::{Lang, Strings, fill};
+use crate::settings::Settings;
+use crate::ui::palette::*;
+use crate::ui::{apply_theme, brand, card, colormap, dot, freq_tuner, metric, wheel_steps};
+
+const WATERFALL_WIDTH: usize = 2048;
+const WATERFALL_ROWS: usize = 400;
+/// Weight of a new spectrum frame in the displayed (smoothed) one.
+const SMOOTHING: f32 = 0.4;
+/// Signals are searched every this many frames.
+const SCAN_EVERY_FRAMES: u32 = 6;
+/// Used until the user picks a frequency (2 m amateur band).
+const DEFAULT_FREQUENCY: f64 = 145_500_000.0;
+const DEFAULT_THRESHOLD_DB: f32 = 8.0;
+/// Mouse wheel steps offered for the listening frequency (Hz).
+const STEPS: [f64; 12] = [1.0, 10.0, 100.0, 500.0, 1e3, 2.5e3, 5e3, 6.25e3, 10e3, 12.5e3, 25e3, 100e3];
+const DEFAULT_STEP: f64 = 5e3;
+/// Narrowest visible band offered (Hz).
+const MIN_SPAN: f64 = 5e3;
+
+#[derive(Clone, Copy, PartialEq)]
+struct FrameInfo {
+    center_hz: f64,
+    sample_rate: f64,
+    lo_hz: f64,
+    hi_hz: f64,
+    bin_hz: f64,
+    points: usize,
+}
+
+pub struct SedirApp {
+    lang: Lang,
+    settings: Settings,
+
+    devices: Vec<DeviceInfo>,
+    discovery: Option<Receiver<Vec<DeviceInfo>>>,
+    device_index: usize,
+    limits: Limits,
+    driver_model: String,
+    network_entry: String,
+
+    handle: Option<Handle>,
+    opened: bool,
+    error: Option<String>,
+    stats: Stats,
+
+    center_hz: f64,
+    vfo_hz: f64,
+    sample_rate: f64,
+    gain_db: f64,
+    auto_gain: bool,
+    view: View,
+    step_hz: f64,
+    threshold_db: f32,
+    entry: String,
+    entry_note: Option<(String, Color32)>,
+
+    frame: Option<FrameInfo>,
+    smoothed: Vec<f32>,
+    range: (f32, f32),
+    waterfall: ColorImage,
+    waterfall_tex: Option<TextureHandle>,
+    signals: Vec<Signal>,
+    frames_since_scan: u32,
+}
+
+impl SedirApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        apply_theme(&cc.egui_ctx);
+        let settings = Settings::load();
+        let center = settings.frequency_hz.unwrap_or(DEFAULT_FREQUENCY);
+        let limits = DeviceKind::Other.limits();
+        let mut app = Self {
+            lang: settings.lang.unwrap_or_else(Lang::from_system),
+            threshold_db: settings.threshold_db.unwrap_or(DEFAULT_THRESHOLD_DB),
+            settings,
+            devices: Vec::new(),
+            discovery: None,
+            device_index: 0,
+            sample_rate: limits.max_rate,
+            limits,
+            driver_model: String::new(),
+            network_entry: String::new(),
+            handle: None,
+            opened: false,
+            error: None,
+            stats: Stats::default(),
+            center_hz: center,
+            vfo_hz: center,
+            gain_db: 30.0,
+            auto_gain: false,
+            view: View::full(2.4e6),
+            step_hz: DEFAULT_STEP,
+            entry: String::new(),
+            entry_note: None,
+            frame: None,
+            smoothed: Vec::new(),
+            range: (-110.0, -30.0),
+            waterfall: ColorImage::new([WATERFALL_WIDTH, WATERFALL_ROWS], vec![DEEP; WATERFALL_WIDTH * WATERFALL_ROWS]),
+            waterfall_tex: None,
+            signals: Vec::new(),
+            frames_since_scan: 0,
+        };
+        app.discover(&cc.egui_ctx);
+        app
+    }
+
+    fn t(&self) -> &'static Strings {
+        self.lang.strings()
+    }
+
+    // ---- Devices ----
+
+    /// Searches for receivers in the background.
+    fn discover(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        let network = self.settings.network_devices.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(device::discover(&network));
+            ctx.request_repaint();
+        });
+        self.discovery = Some(rx);
+    }
+
+    fn poll_discovery(&mut self) {
+        let Some(found) = self.discovery.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+        self.discovery = None;
+        self.devices = found;
+        let index = self
+            .settings
+            .device
+            .as_ref()
+            .and_then(|args| self.devices.iter().position(|d| &d.args == args))
+            .unwrap_or(0);
+        if !self.devices.is_empty() {
+            self.select_device(index);
+        }
+    }
+
+    fn device(&self) -> Option<&DeviceInfo> {
+        self.devices.get(self.device_index)
+    }
+
+    /// Takes the nominal limits of the device and opens the widest band it carries.
+    fn select_device(&mut self, index: usize) {
+        self.device_index = index;
+        let Some(kind) = self.device().map(|d| d.kind) else { return };
+        self.limits = kind.limits();
+        self.driver_model.clear();
+        self.sample_rate = self.limits.max_rate;
+        self.gain_db = kind.default_gain();
+        self.auto_gain = false;
+        self.view = View::full(self.sample_rate);
+        self.entry_note = self.frequency_note(self.vfo_hz).err().or_else(|| self.frequency_note(self.vfo_hz).ok().flatten());
+    }
+
+    /// Whether `hz` can be received: Ok with an optional caution, or Err with the reason.
+    fn frequency_note(&self, hz: f64) -> Result<Option<(String, Color32)>, (String, Color32)> {
+        let t = self.t();
+        let name = self.device().map_or(DeviceKind::Other.name(), |d| d.kind.name());
+        let (lo, hi) = (freq::short(self.limits.min_hz), freq::short(self.limits.max_hz));
+        match self.limits.check(hz) {
+            FreqCheck::Ok => Ok(None),
+            FreqCheck::Weak => {
+                let below = freq::short(self.limits.weak_below_hz.unwrap_or(0.0));
+                Ok(Some((fill(t.weak_range, &[&name, &freq::short(hz), &below]), WARN)))
+            }
+            FreqCheck::TooLow => Err((fill(t.too_low, &[&freq::short(hz), &name, &lo, &hi]), BAD)),
+            FreqCheck::TooHigh => Err((fill(t.too_high, &[&freq::short(hz), &name, &lo, &hi]), BAD)),
+        }
+    }
+
+    fn add_network_device(&mut self, ctx: &egui::Context) {
+        let address = self.network_entry.trim().to_string();
+        if address.is_empty() {
+            return;
+        }
+        if !self.settings.network_devices.contains(&address) {
+            self.settings.network_devices.push(address);
+            self.settings.save();
+        }
+        self.network_entry.clear();
+        self.discover(ctx);
+    }
+
+    // ---- Running ----
+
+    fn gain(&self) -> Option<f64> {
+        (!self.auto_gain).then_some(self.gain_db)
+    }
+
+    fn send(&self, cmd: Command) {
+        if let Some(h) = &self.handle {
+            let _ = h.commands.send(cmd);
+        }
+    }
+
+    fn start(&mut self, ctx: &egui::Context) {
+        let Some(device) = self.device().cloned() else { return };
+        if let Err(note) = self.frequency_note(self.center_hz) {
+            self.entry_note = Some(note);
+            return;
+        }
+        let tuning = Tuning { center_hz: self.center_hz, sample_rate: self.sample_rate, gain: self.gain() };
+        self.view = self.view.clamped(self.sample_rate);
+        let ctx = ctx.clone();
+        self.handle = Some(source::spawn(device.clone(), tuning, self.view, move || ctx.request_repaint()));
+        self.opened = false;
+        self.error = None;
+        self.stats = Stats::default();
+        self.frame = None;
+        self.settings.device = Some(device.args);
+        self.settings.frequency_hz = Some(self.vfo_hz);
+        self.settings.save();
+    }
+
+    fn stop(&mut self) {
+        self.handle = None;
+        self.opened = false;
+        self.stats = Stats::default();
+    }
+
+    fn poll_events(&mut self) {
+        let Some(handle) = &self.handle else { return };
+        let events: Vec<Event> = handle.events.try_iter().collect();
+        for event in events {
+            match event {
+                Event::Opened(driver) => {
+                    self.opened = true;
+                    self.driver_model = driver.model;
+                    let kind = self.device().map_or(DeviceKind::Other, |d| d.kind);
+                    // The HackRF driver reports the synthesiser's range (to 7.25 GHz), wider than the
+                    // receiver is specified for; its nominal range is kept.
+                    let frequency = if kind == DeviceKind::HackRf { None } else { driver.frequency_range };
+                    self.limits.refine(frequency, driver.rate_range);
+                    let rate = self.limits.nearest_rate(self.sample_rate);
+                    if rate != self.sample_rate {
+                        self.set_sample_rate(rate);
+                    }
+                }
+                Event::Frame(frame) => self.push_frame(frame),
+                Event::Stats(s) => self.stats = s,
+                Event::Error(e) => {
+                    self.error = Some(e);
+                    self.handle = None;
+                    self.opened = false;
+                }
+            }
+        }
+    }
+
+    fn set_sample_rate(&mut self, rate: f64) {
+        self.sample_rate = rate;
+        // Zoom is kept as a fraction, so the same part of the band stays in view.
+        let full = self.view.span_hz >= self.frame.map_or(self.view.span_hz, |f| f.sample_rate) * 0.999;
+        self.view = if full { View::full(rate) } else { self.view.clamped(rate) };
+        self.send(Command::SampleRate(rate));
+        self.send(Command::View(self.view));
+    }
+
+    /// Visible band (Hz, absolute).
+    fn view_range(&self) -> (f64, f64) {
+        let c = self.center_hz + self.view.offset_hz;
+        (c - self.view.span_hz / 2.0, c + self.view.span_hz / 2.0)
+    }
+
+    fn set_view(&mut self, view: View) {
+        self.view = view.clamped(self.sample_rate);
+        self.send(Command::View(self.view));
+    }
+
+    /// Tunes the receiver's centre. Refused (with a note) outside the device's range.
+    fn retune(&mut self, hz: f64) -> bool {
+        match self.frequency_note(hz) {
+            Err(note) => {
+                self.entry_note = Some(note);
+                false
+            }
+            Ok(note) => {
+                self.entry_note = note;
+                self.center_hz = hz.round();
+                self.send(Command::Tune(self.center_hz));
+                true
+            }
+        }
+    }
+
+    /// Moves the listening frequency; the view follows, inside the received band when
+    /// possible, otherwise by retuning.
+    fn set_vfo(&mut self, hz: f64) {
+        let hz = hz.max(0.0).round();
+        if let Err(note) = self.frequency_note(hz) {
+            self.entry_note = Some(note);
+            return;
+        }
+        self.vfo_hz = hz;
+        let (lo, hi) = self.view_range();
+        if (lo..=hi).contains(&hz) {
+            return;
+        }
+        let room = self.sample_rate / 2.0 - self.view.span_hz / 2.0;
+        let offset = hz - self.center_hz;
+        if offset.abs() <= room {
+            self.set_view(View { offset_hz: offset, span_hz: self.view.span_hz });
+        } else if self.retune(hz) {
+            self.set_view(View { offset_hz: 0.0, span_hz: self.view.span_hz });
+        }
+    }
+
+    /// Frequency typed in the entry field: centre the band on it and listen there.
+    fn submit_entry(&mut self) {
+        let t = self.t();
+        let Some(hz) = freq::parse(&self.entry) else {
+            self.entry_note = Some((fill(t.bad_number, &[&self.entry.trim()]), BAD));
+            return;
+        };
+        if self.retune(hz) {
+            self.vfo_hz = self.center_hz;
+            self.set_view(View { offset_hz: 0.0, span_hz: self.view.span_hz });
+            self.entry.clear();
+            self.settings.frequency_hz = Some(self.vfo_hz);
+            self.settings.save();
+        }
+    }
+
+    // ---- Spectrum data ----
+
+    fn push_frame(&mut self, frame: Frame) {
+        let info = FrameInfo {
+            center_hz: frame.center_hz,
+            sample_rate: frame.sample_rate,
+            lo_hz: frame.lo_hz,
+            hi_hz: frame.hi_hz,
+            bin_hz: frame.bin_hz,
+            points: frame.db.len(),
+        };
+        let previous = self.frame.replace(info);
+        let same_scale = previous.is_some_and(|p| {
+            p.points == info.points && ((p.hi_hz - p.lo_hz) - (info.hi_hz - info.lo_hz)).abs() < info.bin_hz
+        });
+        let moved = previous.map_or(0.0, |p| info.lo_hz - p.lo_hz);
+        if !same_scale || self.smoothed.len() != frame.db.len() {
+            self.smoothed = frame.db.clone();
+            self.waterfall.pixels.fill(DEEP);
+        } else if moved.abs() > info.bin_hz / 2.0 {
+            // Panned: shift the history instead of blurring it into the new position.
+            let step = (info.hi_hz - info.lo_hz) / info.points as f64;
+            let shift = (moved / step).round() as isize;
+            shift_values(&mut self.smoothed, shift, frame.db.as_slice());
+            let wf_shift = (moved / (info.hi_hz - info.lo_hz) * WATERFALL_WIDTH as f64).round() as isize;
+            for row in self.waterfall.pixels.chunks_exact_mut(WATERFALL_WIDTH) {
+                shift_row(row, wf_shift, DEEP);
+            }
+        } else {
+            for (s, v) in self.smoothed.iter_mut().zip(&frame.db) {
+                *s += SMOOTHING * (v - *s);
+            }
+        }
+
+        // Track the display range slowly from the noise floor and the peak.
+        let mut sorted = self.smoothed.clone();
+        sorted.sort_by(f32::total_cmp);
+        let floor = sorted[sorted.len() / 10] - 8.0;
+        let top = (sorted[sorted.len() - 1] + 8.0).max(floor + 30.0);
+        if previous.is_none() {
+            self.range = (floor, top);
+        } else {
+            self.range.0 += 0.08 * (floor - self.range.0);
+            self.range.1 += 0.08 * (top - self.range.1);
+        }
+
+        // Scroll the waterfall down one row and write the new row at the top.
+        self.waterfall.pixels.copy_within(0..WATERFALL_WIDTH * (WATERFALL_ROWS - 1), WATERFALL_WIDTH);
+        let (lo, hi) = self.range;
+        let n = frame.db.len();
+        for (x, px) in self.waterfall.pixels[..WATERFALL_WIDTH].iter_mut().enumerate() {
+            let a = x * n / WATERFALL_WIDTH;
+            let b = ((x + 1) * n / WATERFALL_WIDTH).max(a + 1).min(n);
+            let v = frame.db[a..b].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            *px = colormap((v - lo) / (hi - lo));
+        }
+        if let Some(tex) = &mut self.waterfall_tex {
+            tex.set(self.waterfall.clone(), TextureOptions::LINEAR);
+        }
+
+        self.frames_since_scan += 1;
+        if self.frames_since_scan >= SCAN_EVERY_FRAMES {
+            self.frames_since_scan = 0;
+            self.signals = detect::find(&self.smoothed, info.lo_hz, info.hi_hz, self.threshold_db);
+        }
+    }
+
+    /// The signal under `hz`, allowing `slack` Hz around its edges.
+    fn signal_at(&self, hz: f64, slack: f64) -> Option<Signal> {
+        self.signals.iter().copied().find(|s| (hz - s.center_hz).abs() <= s.bandwidth_hz / 2.0 + slack)
+    }
+
+    // ---- Header ----
+
+    fn header(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                brand(ui, 30.0);
+                ui.label(RichText::new(t.app_subtitle).size(12.0).color(MUTED));
+            });
+            ui.add_space(28.0);
+            ui.vertical(|ui| {
+                ui.label(RichText::new(t.listening_caps).size(10.0).color(MUTED));
+                let mut hz = self.vfo_hz;
+                if freq_tuner(ui, &mut hz, 26.0) {
+                    self.set_vfo(hz);
+                }
+            });
+            if let Some(s) = self.signal_at(self.vfo_hz, 0.0) {
+                ui.add_space(16.0);
+                metric(ui, t.width_caps, &freq::short(s.bandwidth_hz), TEXT);
+                metric(ui, t.snr_caps, &format!("{:.0} dB", s.snr_db), snr_color(s.snr_db));
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let running = self.handle.is_some();
+                let button = if running {
+                    egui::Button::new(RichText::new(t.stop).strong().color(Color32::WHITE)).fill(BAD.gamma_multiply(0.75))
+                } else {
+                    egui::Button::new(RichText::new(t.start).strong().color(DEEP)).fill(ACCENT)
+                };
+                if ui.add_enabled(running || self.device().is_some(), button.min_size(vec2(140.0, 36.0)).corner_radius(8)).clicked() {
+                    if running {
+                        self.stop();
+                    } else {
+                        self.start(ui.ctx());
+                    }
+                }
+                ui.add_space(8.0);
+                let before = self.lang;
+                egui::ComboBox::from_id_salt("language")
+                    .width(96.0)
+                    .selected_text(self.lang.native_name())
+                    .show_ui(ui, |ui| {
+                        for l in Lang::ALL {
+                            ui.selectable_value(&mut self.lang, l, l.native_name());
+                        }
+                    })
+                    .response
+                    .on_hover_text(t.language);
+                if self.lang != before {
+                    self.settings.lang = Some(self.lang);
+                    self.settings.save();
+                }
+            });
+        });
+    }
+
+    // ---- Left panel ----
+
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let t = self.t();
+            card(ui, t.card_receiver, |ui| self.receiver_card(ui));
+            card(ui, t.card_frequency, |ui| self.frequency_card(ui));
+            card(ui, t.card_view, |ui| self.view_card(ui));
+        });
+    }
+
+    fn receiver_card(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        let running = self.handle.is_some();
+        if self.discovery.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(t.searching).color(MUTED));
+            });
+        } else if self.devices.is_empty() {
+            ui.label(RichText::new(t.no_device).color(WARN));
+            ui.label(RichText::new(t.no_device_help).size(12.0).color(MUTED));
+        } else {
+            let mut index = self.device_index;
+            ui.add_enabled_ui(!running, |ui| {
+                egui::ComboBox::from_id_salt("device")
+                    .width(ui.available_width())
+                    .selected_text(self.devices[index].label.clone())
+                    .show_ui(ui, |ui| {
+                        for (i, d) in self.devices.iter().enumerate() {
+                            ui.selectable_value(&mut index, i, &d.label);
+                        }
+                    });
+            });
+            if index != self.device_index {
+                self.select_device(index);
+            }
+            let range = format!("{}: {} – {}", t.range, freq::short(self.limits.min_hz), freq::short(self.limits.max_hz));
+            ui.label(RichText::new(range).size(12.0).color(MUTED));
+            if !self.driver_model.is_empty() {
+                ui.label(RichText::new(&self.driver_model).size(11.0).color(MUTED));
+            }
+        }
+        ui.add_enabled_ui(!running && self.discovery.is_none(), |ui| {
+            if ui.button(t.search_again).clicked() {
+                self.discover(ui.ctx());
+            }
+        });
+
+        if self.device().is_some() {
+            ui.add_space(6.0);
+            ui.label(t.bandwidth).on_hover_text(t.bandwidth_tooltip);
+            let mut rate = self.sample_rate;
+            egui::ComboBox::from_id_salt("rate").width(ui.available_width()).selected_text(freq::rate(rate)).show_ui(ui, |ui| {
+                for &r in &self.limits.rates {
+                    let label = if r == self.limits.max_rate { format!("{}  ★", freq::rate(r)) } else { freq::rate(r) };
+                    ui.selectable_value(&mut rate, r, label);
+                }
+            });
+            if rate != self.sample_rate {
+                self.set_sample_rate(rate);
+            }
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(t.gain);
+                if self.limits.auto_gain && ui.checkbox(&mut self.auto_gain, t.auto_gain).changed() {
+                    self.send(Command::Gain(self.gain()));
+                }
+            });
+            let (lo, hi) = self.limits.gain;
+            let slider = egui::Slider::new(&mut self.gain_db, lo..=hi).step_by(1.0).suffix(" dB");
+            if ui.add_enabled(!self.auto_gain, slider).changed() {
+                self.send(Command::Gain(self.gain()));
+            }
+        }
+
+        ui.add_space(8.0);
+        ui.label(RichText::new(t.network_device).size(12.0).color(MUTED));
+        ui.horizontal(|ui| {
+            let edit = egui::TextEdit::singleline(&mut self.network_entry).hint_text(t.network_hint).desired_width(ui.available_width() - 60.0);
+            let response = ui.add_enabled(!running, edit);
+            let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.add_enabled(!running, egui::Button::new(t.add)).clicked() || enter {
+                self.add_network_device(ui.ctx());
+            }
+        });
+    }
+
+    fn frequency_card(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        ui.horizontal(|ui| {
+            let edit = egui::TextEdit::singleline(&mut self.entry)
+                .hint_text(t.freq_hint)
+                .font(FontId::monospace(15.0))
+                .desired_width(ui.available_width() - 56.0);
+            let response = ui.add(edit).on_hover_text(t.freq_entry_tooltip);
+            let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.button(RichText::new(t.tune).strong()).clicked() || enter {
+                self.submit_entry();
+            }
+        });
+        if let Some((note, color)) = &self.entry_note {
+            ui.label(RichText::new(note).size(12.0).color(*color));
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(t.step);
+            egui::ComboBox::from_id_salt("step").selected_text(freq::short(self.step_hz)).show_ui(ui, |ui| {
+                for s in STEPS {
+                    ui.selectable_value(&mut self.step_hz, s, freq::short(s));
+                }
+            });
+            if ui.button(t.center).clicked() && self.retune(self.vfo_hz) {
+                self.set_view(View { offset_hz: 0.0, span_hz: self.view.span_hz });
+            }
+        });
+    }
+
+    fn view_card(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        ui.horizontal(|ui| {
+            ui.label(t.span);
+            let full = self.view.span_hz >= self.sample_rate * 0.999;
+            let label = if full { format!("{} ({})", t.full_span, freq::short(self.sample_rate)) } else { freq::short(self.view.span_hz) };
+            let mut span = self.view.span_hz;
+            egui::ComboBox::from_id_salt("span").selected_text(label).show_ui(ui, |ui| {
+                let mut s = self.sample_rate;
+                let mut first = true;
+                while s >= MIN_SPAN {
+                    let text = if first { format!("{} ({})", t.full_span, freq::short(s)) } else { freq::short(s) };
+                    ui.selectable_value(&mut span, s, text);
+                    s /= 2.0;
+                    first = false;
+                }
+            });
+            if span != self.view.span_hz {
+                self.zoom_to(span, self.vfo_hz);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(t.threshold).on_hover_text(t.threshold_tooltip);
+            if ui.add(egui::Slider::new(&mut self.threshold_db, 3.0..=25.0).step_by(1.0).suffix(" dB")).changed() {
+                self.settings.threshold_db = Some(self.threshold_db);
+                self.settings.save();
+            }
+        });
+        if let Some(f) = self.frame {
+            ui.label(RichText::new(format!("{}: {}", t.resolution, freq::short(f.bin_hz.max(1.0)))).size(12.0).color(MUTED));
+        }
+    }
+
+    /// Shows `span` Hz around `anchor` (kept at the same place when possible).
+    fn zoom_to(&mut self, span: f64, anchor: f64) {
+        let (lo, hi) = self.view_range();
+        let k = span / self.view.span_hz;
+        let anchor = anchor.clamp(lo, hi);
+        let center = anchor - (anchor - (lo + hi) / 2.0) * k;
+        self.set_view(View { offset_hz: center - self.center_hz, span_hz: span });
+    }
+
+    // ---- Central area ----
+
+    fn central(&mut self, ui: &mut egui::Ui) {
+        let area = ui.available_rect_before_wrap();
+        ui.allocate_rect(area, Sense::hover());
+        let strip = Rect::from_min_size(area.min, vec2(area.width(), 32.0));
+        let spec = Rect::from_min_max(pos2(area.left(), strip.bottom() + 6.0), area.max);
+        self.signal_strip(ui, strip);
+        self.spectrum(ui, spec);
+    }
+
+    fn signal_strip(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let t = self.t();
+        let mut picked = None;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.label(RichText::new(t.signals_caps).size(10.0).strong().color(MUTED));
+                    if self.signals.is_empty() {
+                        ui.label(RichText::new(t.signals_none).size(11.0).color(MUTED));
+                    }
+                    for s in &self.signals {
+                        let selected = (self.vfo_hz - s.center_hz).abs() <= s.bandwidth_hz / 2.0;
+                        let text = format!("{}  ·  {}  ·  {:.0} dB", mhz_text(s.center_hz), freq::short(s.bandwidth_hz), s.snr_db);
+                        let text = RichText::new(text).monospace().size(12.0);
+                        let button = if selected {
+                            egui::Button::new(text.color(DEEP).strong()).fill(AMBER)
+                        } else {
+                            egui::Button::new(text.color(TEXT))
+                        };
+                        if ui.add(button.corner_radius(12)).on_hover_text(t.signal_tooltip).clicked() {
+                            picked = Some(s.center_hz);
+                        }
+                    }
+                });
+            });
+        });
+        if let Some(hz) = picked {
+            self.set_vfo(hz);
+        }
+    }
+
+    fn spectrum(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let tex = self
+            .waterfall_tex
+            .get_or_insert_with(|| ui.ctx().load_texture("waterfall", self.waterfall.clone(), TextureOptions::LINEAR))
+            .clone();
+        let response = ui.interact(rect, ui.id().with("spectrum"), Sense::click_and_drag()).on_hover_text_at_pointer(self.t().spectrum_help);
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, CornerRadius::same(10), DEEP);
+
+        let full = rect.shrink(1.0);
+        let spec_rect = Rect::from_min_size(full.min, vec2(full.width(), full.height() * 0.45));
+        let axis_h = 20.0;
+        let wf_rect = Rect::from_min_max(pos2(full.left(), spec_rect.bottom() + axis_h), full.max);
+        painter.image(tex.id(), wf_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+
+        // Everything is drawn against the band of the last frame.
+        let (lo_hz, hi_hz) = self.frame.map_or_else(|| self.view_range(), |f| (f.lo_hz, f.hi_hz));
+        let width_hz = (hi_hz - lo_hz).max(1.0);
+        let x_of = |hz: f64| full.left() + ((hz - lo_hz) / width_hz) as f32 * full.width();
+        let hz_of = |x: f32| lo_hz + ((x - full.left()) / full.width()) as f64 * width_hz;
+        let hz_per_px = width_hz / full.width().max(1.0) as f64;
+
+        // dB grid.
+        let (lo, hi) = self.range;
+        let y_of = |db: f32| spec_rect.bottom() - (db - lo) / (hi - lo) * spec_rect.height();
+        let grid = Color32::from_rgb(26, 34, 46);
+        let mut db = (lo / 10.0).ceil() * 10.0;
+        while db < hi {
+            let y = y_of(db);
+            painter.line_segment([pos2(spec_rect.left(), y), pos2(spec_rect.right(), y)], Stroke::new(1.0, grid));
+            painter.text(pos2(spec_rect.left() + 6.0, y - 1.0), Align2::LEFT_BOTTOM, format!("{db:.0} dB"), FontId::monospace(10.0), MUTED);
+            db += 10.0;
+        }
+
+        // Frequency axis: a 1-2-5 step leaving at least ~100 pixels between ticks.
+        let min_step = hz_per_px * 100.0;
+        let step = nice_step(min_step);
+        let axis = Rect::from_min_max(pos2(full.left(), spec_rect.bottom()), pos2(full.right(), wf_rect.top()));
+        painter.rect_filled(axis, CornerRadius::ZERO, BG);
+        let mut f = (lo_hz / step).ceil() * step;
+        while f <= hi_hz {
+            let x = x_of(f);
+            painter.line_segment([pos2(x, spec_rect.top()), pos2(x, spec_rect.bottom())], Stroke::new(1.0, grid));
+            painter.text(pos2(x, axis.center().y), Align2::CENTER_CENTER, axis_label(f, step), FontId::monospace(11.0), MUTED);
+            f += step;
+        }
+
+        // Signals found.
+        for s in &self.signals {
+            let half = (s.bandwidth_hz / 2.0).max(hz_per_px);
+            let band = Rect::from_x_y_ranges(x_of(s.center_hz - half)..=x_of(s.center_hz + half), spec_rect.y_range());
+            painter.rect_filled(band, CornerRadius::ZERO, AMBER.gamma_multiply(0.07));
+            let tick = Rect::from_x_y_ranges(band.x_range(), spec_rect.top()..=spec_rect.top() + 3.0);
+            painter.rect_filled(tick, CornerRadius::ZERO, AMBER.gamma_multiply(0.6));
+        }
+
+        // Spectrum: gradient fill below, line on top.
+        if self.smoothed.len() > 1 {
+            let n = self.smoothed.len();
+            let points: Vec<Pos2> = self
+                .smoothed
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let x = spec_rect.left() + (i as f32 + 0.5) / n as f32 * spec_rect.width();
+                    pos2(x, y_of(v).clamp(spec_rect.top(), spec_rect.bottom()))
+                })
+                .collect();
+            let mut mesh = Mesh::default();
+            for p in &points {
+                let k = 1.0 - (p.y - spec_rect.top()) / spec_rect.height();
+                mesh.colored_vertex(*p, SPECTRUM.gamma_multiply(0.12 + 0.35 * k));
+                mesh.colored_vertex(pos2(p.x, spec_rect.bottom()), SPECTRUM.gamma_multiply(0.02));
+            }
+            for i in 0..n as u32 - 1 {
+                let a = 2 * i;
+                mesh.add_triangle(a, a + 1, a + 2);
+                mesh.add_triangle(a + 1, a + 3, a + 2);
+            }
+            painter.add(Shape::mesh(mesh));
+            painter.add(Shape::line(points, Stroke::new(1.3, SPECTRUM)));
+        }
+
+        // Listening frequency.
+        let vx = x_of(self.vfo_hz);
+        if (full.left()..=full.right()).contains(&vx) {
+            painter.line_segment([pos2(vx, spec_rect.top()), pos2(vx, wf_rect.bottom())], Stroke::new(1.5, AMBER));
+            let galley = painter.layout_no_wrap(mhz_text(self.vfo_hz), FontId::monospace(11.0), DEEP);
+            let x = (vx - galley.size().x / 2.0 - 6.0).clamp(full.left() + 2.0, full.right() - galley.size().x - 14.0);
+            let tag = Rect::from_min_size(pos2(x, spec_rect.top() + 6.0), galley.size() + vec2(12.0, 4.0));
+            painter.rect_filled(tag, CornerRadius::same(4), AMBER);
+            painter.galley(tag.min + vec2(6.0, 2.0), galley, DEEP);
+        }
+
+        // Frequency under the mouse cursor.
+        if let Some(pos) = response.hover_pos() {
+            painter.line_segment([pos2(pos.x, spec_rect.top()), pos2(pos.x, wf_rect.bottom())], Stroke::new(1.0, Color32::from_white_alpha(60)));
+            let label = format!("{} MHz", mhz_text(hz_of(pos.x)));
+            let galley = painter.layout_no_wrap(label, FontId::monospace(12.0), TEXT);
+            let at = pos2((pos.x + 10.0).min(spec_rect.right() - galley.size().x - 12.0), spec_rect.top() + 34.0);
+            let bg = Rect::from_min_size(at - vec2(6.0, 3.0), galley.size() + vec2(12.0, 6.0));
+            painter.rect_filled(bg, CornerRadius::same(4), Color32::from_black_alpha(190));
+            painter.galley(at, galley, TEXT);
+        }
+
+        if self.handle.is_none() {
+            return;
+        }
+        // Dragging moves the visible band: inside the received band while zoomed, by retuning otherwise.
+        if response.dragged() && response.drag_delta().x != 0.0 {
+            let shift = -(response.drag_delta().x as f64) * hz_per_px;
+            let wanted = self.view.offset_hz + shift;
+            let room = (self.sample_rate - self.view.span_hz) / 2.0;
+            if wanted.abs() <= room {
+                self.set_view(View { offset_hz: wanted, span_hz: self.view.span_hz });
+            } else {
+                let excess = wanted - wanted.clamp(-room, room);
+                self.retune(self.center_hz + excess);
+                self.set_view(View { offset_hz: wanted.clamp(-room, room), span_hz: self.view.span_hz });
+            }
+        }
+        if response.hovered() {
+            let zoom = ui.input(|i| i.zoom_delta());
+            let ctrl = ui.input(|i| i.modifiers.command);
+            if zoom != 1.0 {
+                let anchor = response.hover_pos().map_or(self.vfo_hz, |p| hz_of(p.x));
+                let span = (self.view.span_hz / zoom as f64).clamp(MIN_SPAN, self.sample_rate);
+                self.zoom_to(span, anchor);
+            } else if !ctrl {
+                let (steps, shift) = wheel_steps(ui);
+                if steps != 0 {
+                    let step = if shift { self.step_hz * 10.0 } else { self.step_hz };
+                    self.set_vfo(((self.vfo_hz / step).round() + steps as f64) * step);
+                }
+            }
+        }
+        if let Some(pos) = response.interact_pointer_pos() {
+            if response.clicked() || response.double_clicked() {
+                let hz = hz_of(pos.x);
+                // A click on a found signal selects its centre.
+                let hz = self.signal_at(hz, 3.0 * hz_per_px).map_or(hz, |s| s.center_hz);
+                self.set_vfo(hz);
+                if response.double_clicked() && self.retune(self.vfo_hz) {
+                    self.set_view(View { offset_hz: 0.0, span_hz: self.view.span_hz });
+                }
+            }
+        }
+    }
+
+    fn status_bar(&self, ui: &mut egui::Ui) {
+        let t = self.t();
+        ui.horizontal(|ui| {
+            let label = self.device().map_or("", |d| d.label.as_str());
+            let (color, text) = if let Some(e) = &self.error {
+                (BAD, fill(t.error, &[e]))
+            } else if self.handle.is_none() {
+                (MUTED, t.stopped.to_string())
+            } else if !self.opened {
+                (WARN, fill(t.opening, &[&label]))
+            } else {
+                let kind = self.device().map_or("", |d| d.kind.name());
+                (GOOD, fill(t.running, &[&kind, &freq::rate(self.sample_rate), &freq::short(self.center_hz)]))
+            };
+            dot(ui, color);
+            ui.label(RichText::new(text).size(12.0).color(if self.error.is_some() { BAD } else { MUTED }));
+            if self.opened && self.stats.measured_rate > 0.0 {
+                let percent = (self.stats.measured_rate / self.sample_rate * 100.0).min(100.0);
+                let c = if percent >= 98.0 { GOOD } else if percent >= 90.0 { WARN } else { BAD };
+                ui.add_space(12.0);
+                ui.label(RichText::new(fill(t.stream, &[&freq::rate(self.stats.measured_rate), &format!("{percent:.0}")])).size(12.0).color(c))
+                    .on_hover_text(t.stream_tooltip);
+                let lost = self.stats.overflows + self.stats.dropped_blocks;
+                if lost > 0 {
+                    ui.label(RichText::new(fill(t.lost, &[&lost])).size(12.0).color(WARN));
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new("GPL-3.0").size(11.0).color(MUTED));
+                ui.label(RichText::new("yAtölye").size(13.0).strong().color(AMBER));
+                ui.label(RichText::new(format!("SeDiR {} ·", env!("CARGO_PKG_VERSION"))).size(12.0).color(MUTED));
+            });
+        });
+    }
+}
+
+impl eframe::App for SedirApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.poll_discovery();
+        self.poll_events();
+
+        let bar = egui::Frame::new().fill(CARD).inner_margin(egui::Margin::symmetric(14, 8));
+        egui::Panel::top("header").frame(bar).show(ui, |ui| self.header(ui));
+        egui::Panel::bottom("status")
+            .frame(egui::Frame::new().fill(DEEP).inner_margin(egui::Margin::symmetric(12, 4)))
+            .show(ui, |ui| self.status_bar(ui));
+        egui::Panel::left("sidebar")
+            .resizable(true)
+            .default_size(310.0)
+            .size_range(270.0..=440.0)
+            .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(10)))
+            .show(ui, |ui| self.sidebar(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(10)))
+            .show(ui, |ui| self.central(ui));
+    }
+}
+
+/// 145_500_000 → "145.500 000".
+fn mhz_text(hz: f64) -> String {
+    let hz = hz.max(0.0).round() as u64;
+    format!("{}.{:03} {:03}", hz / 1_000_000, hz / 1000 % 1000, hz % 1000)
+}
+
+/// Smallest 1-2-5 step (Hz) not below `min`.
+fn nice_step(min: f64) -> f64 {
+    let mut scale = 1.0;
+    loop {
+        for m in [1.0, 2.0, 5.0] {
+            if m * scale >= min {
+                return m * scale;
+            }
+        }
+        scale *= 10.0;
+    }
+}
+
+/// Axis label with as many decimals (in MHz) as the tick step needs.
+fn axis_label(hz: f64, step: f64) -> String {
+    let decimals = if step >= 1e6 { 0 } else if step >= 1e5 { 1 } else if step >= 1e4 { 2 } else if step >= 1e3 { 3 } else if step >= 100.0 { 4 } else { 6 };
+    format!("{:.*}", decimals, hz / 1e6)
+}
+
+fn snr_color(snr: f32) -> Color32 {
+    if snr >= 20.0 {
+        GOOD
+    } else if snr >= 10.0 {
+        WARN
+    } else {
+        BAD
+    }
+}
+
+/// Moves values by `shift` places towards lower indices (the band moved up by that many
+/// points); places uncovered are taken from `fresh`.
+fn shift_values(values: &mut [f32], shift: isize, fresh: &[f32]) {
+    let n = values.len() as isize;
+    let old = values.to_vec();
+    for (i, v) in values.iter_mut().enumerate() {
+        let src = i as isize + shift;
+        *v = if (0..n).contains(&src) { old[src as usize] } else { fresh[i] };
+    }
+}
+
+fn shift_row(row: &mut [Color32], shift: isize, empty: Color32) {
+    let n = row.len() as isize;
+    if shift.abs() >= n {
+        row.fill(empty);
+    } else if shift > 0 {
+        row.copy_within(shift as usize.., 0);
+        row[(n - shift) as usize..].fill(empty);
+    } else if shift < 0 {
+        let s = (-shift) as usize;
+        row.copy_within(..(n as usize - s), s);
+        row[..s].fill(empty);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_and_steps() {
+        assert_eq!(mhz_text(145_500_000.0), "145.500 000");
+        assert_eq!(mhz_text(7_074_250.0), "7.074 250");
+        assert_eq!(nice_step(130_000.0), 200_000.0);
+        assert_eq!(nice_step(0.7), 1.0);
+        assert_eq!(axis_label(145.25e6, 2.5e5), "145.2");
+    }
+
+    #[test]
+    fn shifting_keeps_history_aligned() {
+        let mut row = [1, 2, 3, 4].map(|v| Color32::from_gray(v));
+        shift_row(&mut row, 1, Color32::BLACK);
+        assert_eq!(row, [2, 3, 4, 0].map(|v| Color32::from_gray(v)));
+        let mut v = [1.0, 2.0, 3.0];
+        shift_values(&mut v, -1, &[9.0, 9.0, 9.0]);
+        assert_eq!(v, [9.0, 1.0, 2.0]);
+    }
+}
