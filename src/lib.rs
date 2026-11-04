@@ -2,6 +2,8 @@
 //! window, so that it can be tested on its own.
 
 pub mod audio;
+pub mod bandplan;
+pub mod classify;
 pub mod demod;
 pub mod detect;
 pub mod device;

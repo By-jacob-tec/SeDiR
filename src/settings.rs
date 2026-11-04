@@ -21,6 +21,8 @@ pub struct Settings {
     pub volume: Option<f32>,
     /// Whether station names are read from RDS in the background.
     pub find_names: Option<bool>,
+    /// Whether clicking a signal recognises its mode.
+    pub auto_mode: Option<bool>,
 }
 
 fn path() -> Option<PathBuf> {
@@ -50,6 +52,7 @@ impl Settings {
                 "audio_device" if !value.is_empty() => s.audio_device = Some(value.to_string()),
                 "volume" => s.volume = value.parse().ok(),
                 "find_names" => s.find_names = value.parse().ok(),
+                "auto_mode" => s.auto_mode = value.parse().ok(),
                 _ => {}
             }
         }
@@ -85,6 +88,9 @@ impl Settings {
         if let Some(f) = self.find_names {
             out += &format!("find_names={f}\n");
         }
+        if let Some(a) = self.auto_mode {
+            out += &format!("auto_mode={a}\n");
+        }
         out
     }
 
@@ -119,6 +125,7 @@ mod tests {
             audio_device: Some("wasapi:{0.0.0.00000000}.{abc}".into()),
             volume: Some(70.0),
             find_names: Some(false),
+            auto_mode: Some(true),
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
     }

@@ -8,6 +8,7 @@ use eframe::egui::{
 };
 
 use sedir::audio::{self, AudioBuffer, AudioOutput, OutputDevice, Volume};
+use sedir::classify::{self, Classification, Reason};
 use sedir::demod::Mode;
 use sedir::detect::{self, Signal};
 use sedir::device::{self, DeviceInfo, DeviceKind, FreqCheck, Limits};
@@ -42,6 +43,8 @@ const LISTEN_ID: u32 = 1;
 const LISTEN_QUEUE: usize = 32;
 /// Subscriber id of the station name scanner.
 const SCAN_ID: u32 = 2;
+/// Subscriber id of a mode recognition job.
+const CLASSIFY_ID: u32 = 3;
 /// Signals at least this wide and this far above the noise, inside the FM broadcast
 /// bands (OIRT 65.8–74 MHz included), are searched for RDS.
 const FM_MIN_WIDTH_HZ: f64 = 50e3;
@@ -103,6 +106,11 @@ pub struct SedirApp {
     stations: Stations,
     find_names: bool,
     rds: Option<RdsInfo>,
+    auto_mode: bool,
+    /// Recognition in progress.
+    classifying: Option<Receiver<Option<Classification>>>,
+    /// Last result: Some(Some) recognised, Some(None) failed.
+    classification: Option<Option<Classification>>,
 
     audio_buffer: AudioBuffer,
     volume: Volume,
@@ -127,6 +135,9 @@ impl SedirApp {
         let logo = ColorImage::from_rgba_unmultiplied([LOGO_PIXELS, LOGO_PIXELS], &crate::logo::rgba(LOGO_PIXELS, false));
         let find_names = settings.find_names.unwrap_or(true);
         let mut app = Self {
+            auto_mode: settings.auto_mode.unwrap_or(true),
+            classifying: None,
+            classification: None,
             stations: Stations::new(find_names),
             find_names,
             rds: None,
@@ -341,6 +352,41 @@ impl SedirApp {
         self.step_hz = mode.default_step();
         self.settings.mode = Some(mode.name().to_string());
         self.settings.save();
+    }
+
+    /// A click on the spectrum at `hz`, on `signal` if one was found there. With automatic
+    /// mode the signal is measured and the result applied when it arrives; otherwise the
+    /// current mode is kept.
+    fn select_at(&mut self, hz: f64, signal: Option<Signal>) {
+        if self.auto_mode && self.handle.is_some() {
+            let target = signal.map_or(hz, |s| s.center_hz);
+            self.set_vfo(target);
+            let (tx, rx) = mpsc::sync_channel(LISTEN_QUEUE);
+            // Replaces a job still running: its channel closes and it stops.
+            self.send(Command::Subscribe(CLASSIFY_ID, tx));
+            let width = signal.map_or(3e3, |s| s.bandwidth_hz);
+            self.classifying = Some(classify::spawn_job(rx, target, width));
+            self.classification = None;
+        } else {
+            let hz = match signal {
+                Some(s) if self.mode.snaps_to_center() => self.mode.round_to_channel(s.center_hz),
+                _ => hz,
+            };
+            self.set_vfo(hz);
+        }
+    }
+
+    fn poll_classification(&mut self) {
+        let Some(result) = self.classifying.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+        self.classifying = None;
+        self.send(Command::Unsubscribe(CLASSIFY_ID));
+        if let Some(c) = &result {
+            self.set_mode(c.mode);
+            let (lo, hi) = c.mode.bandwidth_range();
+            self.bandwidth_hz = c.bandwidth_hz.clamp(lo, hi);
+            self.set_vfo(c.frequency_hz);
+        }
+        self.classification = Some(result);
     }
 
     /// Hands the current listening settings to the demodulator thread.
@@ -632,6 +678,27 @@ impl SedirApp {
             }
         });
         self.set_mode(mode);
+        ui.horizontal(|ui| {
+            if ui.checkbox(&mut self.auto_mode, t.auto_mode).on_hover_text(t.auto_mode_tooltip).changed() {
+                self.settings.auto_mode = Some(self.auto_mode);
+                self.settings.save();
+            }
+        });
+        if self.classifying.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(t.recognising).size(12.0).color(MUTED));
+            });
+        } else if let Some(result) = &self.classification {
+            let text = match result {
+                Some(c) => {
+                    let why = c.reasons.iter().map(|r| reason_text(*r, t)).collect::<Vec<_>>().join(", ");
+                    fill(t.recognised, &[&c.mode.name(), &format!("{:.0}", c.confidence * 100.0), &why])
+                }
+                None => t.not_recognised.to_string(),
+            };
+            ui.label(RichText::new(text).size(12.0).color(if result.is_some() { ACCENT } else { WARN }));
+        }
         ui.add_space(4.0);
         let (lo, hi) = self.mode.bandwidth_range();
         let mut khz = self.bandwidth_hz / 1e3;
@@ -897,7 +964,8 @@ impl SedirApp {
             });
         });
         if let Some(hz) = picked {
-            self.set_vfo(self.mode.round_to_channel(hz));
+            let signal = self.signal_at(hz, 0.0);
+            self.select_at(hz, signal);
         }
     }
 
@@ -1082,10 +1150,8 @@ impl SedirApp {
         if let Some(pos) = response.interact_pointer_pos() {
             if response.clicked() || response.double_clicked() {
                 let hz = hz_of(pos.x);
-                // A click on a found signal selects its centre (in modes with a centre to find).
-                let snapped = self.mode.snaps_to_center().then(|| self.signal_at(hz, 3.0 * hz_per_px)).flatten();
-                let hz = snapped.map_or(hz, |s| self.mode.round_to_channel(s.center_hz));
-                self.set_vfo(hz);
+                let signal = self.signal_at(hz, 3.0 * hz_per_px);
+                self.select_at(hz, signal);
                 if response.double_clicked() && self.retune(self.vfo_hz) {
                     self.set_view(View { offset_hz: 0.0, span_hz: self.view.span_hz });
                 }
@@ -1172,6 +1238,7 @@ impl eframe::App for SedirApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_discovery();
         self.poll_events();
+        self.poll_classification();
         self.sync_listener();
         if self.handle.is_some() {
             // Keeps the signal meter moving between spectrum frames.
@@ -1199,6 +1266,20 @@ impl eframe::App for SedirApp {
             .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(10)))
             .show(ui, |ui| self.central(ui));
     }
+}
+
+fn reason_text(r: Reason, t: &Strings) -> &'static str {
+    let i = match r {
+        Reason::Wide => 0,
+        Reason::ConstantEnvelope => 1,
+        Reason::CarrierAndSidebands => 2,
+        Reason::VoiceAboveCarrier => 3,
+        Reason::VoiceBelowCarrier => 4,
+        Reason::NarrowCarrier => 5,
+        Reason::Keyed => 6,
+        Reason::BandPlan => 7,
+    };
+    t.reasons[i]
 }
 
 /// Horizontal meter of the listened signal's power, with the squelch level marked.

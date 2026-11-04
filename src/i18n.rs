@@ -127,6 +127,13 @@ pub struct Strings {
     pub af_tooltip: &'static str,
     /// Programme type names (RDS, European table).
     pub pty: [&'static str; 32],
+    pub auto_mode: &'static str,
+    pub auto_mode_tooltip: &'static str,
+    pub recognising: &'static str,
+    pub recognised: &'static str,
+    pub not_recognised: &'static str,
+    /// Texts for classify::Reason, in its order.
+    pub reasons: [&'static str; 8],
 }
 
 pub static EN: Strings = Strings {
@@ -201,6 +208,21 @@ pub static EN: Strings = Strings {
         "Weather", "Finance", "Children's programmes", "Social affairs", "Religion", "Phone-in", "Travel", "Leisure",
         "Jazz music", "Country music", "National music", "Oldies music", "Folk music", "Documentary", "Alarm test", "Alarm",
     ],
+    auto_mode: "Automatic mode",
+    auto_mode_tooltip: "When a signal is clicked, its kind is measured and the mode, filter and tuning are set to match.",
+    recognising: "Recognising the signal…",
+    recognised: "{} · {}% sure · {}",
+    not_recognised: "Could not measure the signal (it moved out of the band).",
+    reasons: [
+        "wide",
+        "constant amplitude",
+        "carrier with sidebands",
+        "one-sided, carrier below",
+        "one-sided, carrier above",
+        "single carrier",
+        "keyed on and off",
+        "band plan",
+    ],
 };
 
 pub static TR: Strings = Strings {
@@ -274,6 +296,21 @@ pub static TR: Strings = Strings {
         "Bilim", "Çeşitli", "Pop müzik", "Rock müzik", "Hafif müzik", "Hafif klasik", "Klasik müzik", "Diğer müzik",
         "Hava durumu", "Ekonomi", "Çocuk programları", "Toplumsal konular", "Din", "Telefonla katılım", "Seyahat", "Boş zaman",
         "Caz", "Country", "Ulusal müzik", "Eski şarkılar", "Halk müziği", "Belgesel", "Alarm testi", "Alarm",
+    ],
+    auto_mode: "Otomatik tür",
+    auto_mode_tooltip: "Bir sinyale tıklayınca türü ölçülür; tür, filtre ve frekans ona göre ayarlanır.",
+    recognising: "Sinyal tanınıyor…",
+    recognised: "{} · %{} emin · {}",
+    not_recognised: "Sinyal ölçülemedi (bant dışına çıktı).",
+    reasons: [
+        "geniş",
+        "sabit genlik",
+        "taşıyıcı ve iki yan bant",
+        "tek yanlı, taşıyıcı altta",
+        "tek yanlı, taşıyıcı üstte",
+        "tek taşıyıcı",
+        "açılıp kapanıyor",
+        "bant planı",
     ],
 };
 
