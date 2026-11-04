@@ -565,7 +565,7 @@ impl SedirApp {
                 metric(ui, t.level_caps, &format!("{level:.0} dBFS"), TEXT);
             }
             if let Some(s) = self.signal_at(self.vfo_hz, 0.0) {
-                metric(ui, t.width_caps, &freq::short(s.bandwidth_hz), TEXT);
+                metric(ui, t.width_caps, &freq::width(s.bandwidth_hz), TEXT);
                 metric(ui, t.snr_caps, &format!("{:.0} dB", s.snr_db), snr_color(s.snr_db));
             }
 
@@ -879,7 +879,7 @@ impl SedirApp {
                     }
                     for s in &self.signals {
                         let selected = (self.vfo_hz - s.center_hz).abs() <= s.bandwidth_hz / 2.0;
-                        let mut text = format!("{}  ·  {}  ·  {:.0} dB", mhz_text(s.center_hz), freq::short(s.bandwidth_hz), s.snr_db);
+                        let mut text = format!("{:.3}  ·  {}  ·  {:.0} dB", s.center_hz / 1e6, freq::width(s.bandwidth_hz), s.snr_db);
                         if let Some(name) = self.stations.name_near(s.center_hz) {
                             text = format!("{name}  ·  {text}");
                         }
@@ -897,7 +897,7 @@ impl SedirApp {
             });
         });
         if let Some(hz) = picked {
-            self.set_vfo(hz);
+            self.set_vfo(self.mode.round_to_channel(hz));
         }
     }
 
@@ -987,10 +987,18 @@ impl SedirApp {
         // Station names above their peaks, strongest first; a label that would overlap one
         // already drawn moves up a row, or is left out.
         let mut placed: Vec<Rect> = Vec::new();
-        let mut named: Vec<(&Signal, String)> =
-            self.signals.iter().filter_map(|s| self.stations.name_near(s.center_hz).map(|n| (s, n))).collect();
+        let mut named: Vec<(&Signal, f64, String)> = Vec::new();
+        for s in &self.signals {
+            let Some((station, name)) = self.stations.station_near(s.center_hz) else { continue };
+            // One label per station, on its strongest signal.
+            match named.iter_mut().find(|(_, f, _)| *f == station) {
+                Some(entry) if entry.0.snr_db < s.snr_db => entry.0 = s,
+                Some(_) => {}
+                None => named.push((s, station, name)),
+            }
+        }
         named.sort_by(|a, b| b.0.snr_db.total_cmp(&a.0.snr_db));
-        for (s, name) in named {
+        for (s, _, name) in named {
             let x = x_of(s.center_hz);
             if !(full.left()..=full.right()).contains(&x) {
                 continue;
@@ -1076,7 +1084,7 @@ impl SedirApp {
                 let hz = hz_of(pos.x);
                 // A click on a found signal selects its centre (in modes with a centre to find).
                 let snapped = self.mode.snaps_to_center().then(|| self.signal_at(hz, 3.0 * hz_per_px)).flatten();
-                let hz = snapped.map_or(hz, |s| s.center_hz);
+                let hz = snapped.map_or(hz, |s| self.mode.round_to_channel(s.center_hz));
                 self.set_vfo(hz);
                 if response.double_clicked() && self.retune(self.vfo_hz) {
                     self.set_view(View { offset_hz: 0.0, span_hz: self.view.span_hz });

@@ -34,6 +34,18 @@ pub fn short(hz: f64) -> String {
     format!("{text} {unit}")
 }
 
+/// Width of a signal, rounded to what the spectrum can tell: "137 kHz", "12.5 kHz",
+/// "2.4 kHz", "500 Hz".
+pub fn width(hz: f64) -> String {
+    if hz >= 100e3 {
+        format!("{:.0} kHz", hz / 1e3)
+    } else if hz >= 1e3 {
+        format!("{} kHz", trim(hz / 1e3, 1))
+    } else {
+        format!("{:.0} Hz", hz)
+    }
+}
+
 /// Sample rate or bandwidth, e.g. 2_400_000 → "2.4 MS/s".
 pub fn rate(sps: f64) -> String {
     if sps >= 1e6 {
@@ -73,5 +85,9 @@ mod tests {
         assert_eq!(short(500e3), "500 kHz");
         assert_eq!(rate(2.4e6), "2.4 MS/s");
         assert_eq!(rate(250e3), "250 kS/s");
+        assert_eq!(width(136_718.75), "137 kHz");
+        assert_eq!(width(63_476.562), "63.5 kHz");
+        assert_eq!(width(12_500.0), "12.5 kHz");
+        assert_eq!(width(488.3), "488 Hz");
     }
 }

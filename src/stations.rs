@@ -48,7 +48,9 @@ impl Stations {
 
     pub fn record(&self, hz: f64, name: &str) {
         let name = name.trim();
-        if name.is_empty() {
+        // Stations that scroll text through the name field can leave a fragment such as
+        // "S" looking stable; a name needs at least two letters or digits.
+        if name.chars().filter(|c| c.is_alphanumeric()).count() < 2 {
             return;
         }
         let mut inner = self.0.lock().unwrap();
@@ -60,13 +62,19 @@ impl Stations {
 
     /// Name of the station nearest to `hz`, if one is known within the same channel.
     pub fn name_near(&self, hz: f64) -> Option<String> {
+        self.station_near(hz).map(|(_, n)| n)
+    }
+
+    /// Frequency the name was found on, and the name, of the station nearest to `hz`.
+    /// Several signals found on the spectrum can belong to one station; they share this.
+    pub fn station_near(&self, hz: f64) -> Option<(f64, String)> {
         let inner = self.0.lock().unwrap();
         inner
             .names
             .iter()
             .filter(|(f, _)| (f - hz).abs() < SAME_STATION_HZ)
             .min_by(|a, b| (a.0 - hz).abs().total_cmp(&(b.0 - hz).abs()))
-            .map(|(_, n)| n.clone())
+            .cloned()
     }
 
     /// Reads names in the background until the source stops.
@@ -152,5 +160,7 @@ mod tests {
         assert_eq!(s.name_near(96.7e6), None);
         s.record(102.21e6, "KRAL POP");
         assert_eq!(s.name_near(102.2e6).as_deref(), Some("KRAL POP"));
+        s.record(103.9e6, "       S");
+        assert_eq!(s.name_near(103.9e6), None, "fragments are not names");
     }
 }

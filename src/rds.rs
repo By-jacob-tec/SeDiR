@@ -196,8 +196,10 @@ fn mjd_to_date(mjd: u32) -> Option<(u32, u32, u32)> {
 }
 
 /// RDS characters (EBU Latin table, IEC 62106 Annex E) to text. 0x20–0x7D are as in
-/// ASCII; the upper half is mapped for the letters used in Turkish and other European
+/// ASCII; 0x80–0xDF are mapped for the letters used in Turkish and other European
 /// languages. Turkish stations send ğ/Ğ with the code of ǧ/Ǧ, so those show as ğ/Ğ.
+/// Many stations send 0xE0–0xFF as Latin-1 instead of the EBU table (e.g. 0xEB for ë),
+/// and the EBU letters there are rare, so that range is read as Latin-1.
 pub fn decode_text(bytes: &[u8]) -> String {
     const HIGH: [&str; 6] = [
         "áàéèíìóòúùÑÇŞß¡Ĳ",
@@ -215,6 +217,7 @@ pub fn decode_text(bytes: &[u8]) -> String {
                 let row: Vec<char> = HIGH[(b as usize - 0x80) >> 4].chars().collect();
                 row.get(b as usize & 0xF).copied().unwrap_or(' ')
             }
+            0xE0..=0xFF => b as char,
             _ => ' ',
         })
         .collect()
@@ -458,6 +461,7 @@ mod tests {
         assert_eq!(mjd_to_date(45218), Some((1982, 9, 6)));
         assert_eq!(decode_text(b"KRAL FM "), "KRAL FM ");
         assert_eq!(decode_text(&[0x9C, 0x9E, 0x8B, 0xB5, 0x9D]), "şıÇİğ");
+        assert_eq!(decode_text(b"Ga\xEBtan"), "Gaëtan");
     }
 
     /// RDS groups for a station: PS in four 0A groups, radio text in 2A groups.

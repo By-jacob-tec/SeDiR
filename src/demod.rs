@@ -206,6 +206,20 @@ impl Mode {
         }
     }
 
+    /// A signal centre measured on the spectrum, moved to the channel raster the mode is
+    /// used with: broadcast FM is on a 50/100 kHz raster, narrow FM on 6.25 kHz (which
+    /// also holds the 12.5 and 25 kHz rasters), AM to the kHz. The spectrum's estimate is
+    /// only as good as a few FFT bins, so the raster gives the true frequency.
+    pub fn round_to_channel(self, hz: f64) -> f64 {
+        let raster = match self {
+            Mode::Wfm => 50e3,
+            Mode::Nfm => 6.25e3,
+            Mode::Am => 1e3,
+            Mode::Usb | Mode::Lsb | Mode::Cw => 1.0,
+        };
+        (hz / raster).round() * raster
+    }
+
     /// Whether a click on a found signal should tune to its centre (carrier-less modes
     /// are tuned to the edge, which the spectrum cannot tell exactly).
     pub fn snaps_to_center(self) -> bool {
