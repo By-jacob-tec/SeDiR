@@ -32,6 +32,9 @@ pub struct Settings {
     /// FT8 decoding on, and its dial frequency (radio frequency, Hz).
     pub ft8_on: Option<bool>,
     pub ft8_dial_hz: Option<f64>,
+    /// The same for FT4.
+    pub ft4_on: Option<bool>,
+    pub ft4_dial_hz: Option<f64>,
 }
 
 fn path() -> Option<PathBuf> {
@@ -67,6 +70,8 @@ impl Settings {
                 "beacon_lock" => s.beacon_lock = value.parse().ok(),
                 "ft8_on" => s.ft8_on = value.parse().ok(),
                 "ft8_dial_hz" => s.ft8_dial_hz = value.parse().ok(),
+                "ft4_on" => s.ft4_on = value.parse().ok(),
+                "ft4_dial_hz" => s.ft4_dial_hz = value.parse().ok(),
                 _ => {}
             }
         }
@@ -120,6 +125,12 @@ impl Settings {
         if let Some(d) = self.ft8_dial_hz {
             out += &format!("ft8_dial_hz={d}\n");
         }
+        if let Some(f) = self.ft4_on {
+            out += &format!("ft4_on={f}\n");
+        }
+        if let Some(d) = self.ft4_dial_hz {
+            out += &format!("ft4_dial_hz={d}\n");
+        }
         out
     }
 
@@ -160,6 +171,8 @@ mod tests {
             beacon_lock: Some(true),
             ft8_on: Some(true),
             ft8_dial_hz: Some(10_489.54e6),
+            ft4_on: Some(false),
+            ft4_dial_hz: Some(14.08e6),
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
     }

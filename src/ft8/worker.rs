@@ -1,6 +1,6 @@
-//! Feeds the FT8 decoder: brings the 3 kHz above an FT8 dial frequency down to the
-//! decoder's 6400 S/s baseband, keeps it with UTC time stamps from the computer's clock
-//! (which the user keeps right, e.g. with GPS or NTP), and decodes each 15 s slot.
+//! Feeds the FT8 or FT4 decoder: brings the 3 kHz above a dial frequency down to the
+//! decoder's baseband, keeps it with UTC time stamps from the computer's clock (which
+//! the user keeps right, e.g. with GPS or NTP), and decodes each slot.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -10,9 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use num_complex::Complex;
 
-use super::decode::{self, RATE};
+use super::Protocol;
+use super::decode;
 use super::message::CallBook;
-use super::{SLOT_SECONDS, START_SECONDS};
 use crate::demod::{FirDecimator, Mixer, halfband, lowpass, taps_for};
 use crate::source::Block;
 
@@ -21,8 +21,6 @@ use crate::source::Block;
 pub const CENTER_ABOVE_DIAL_HZ: f64 = 1600.0;
 /// Audio range searched (Hz above the dial).
 const AUDIO_RANGE_HZ: (f64, f64) = (100.0, 3100.0);
-/// A slot is decoded when this much of it has arrived (transmissions end at 13.14 s).
-const DECODE_AT_S: f64 = 14.0;
 /// Audio kept (seconds).
 const KEEP_S: f64 = 32.0;
 /// Messages kept for display.
@@ -45,6 +43,8 @@ const DELAY_AFTER: usize = 5;
 /// One decoded message.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ft8Message {
+    /// "FT8" or "FT4".
+    pub mode: &'static str,
     /// Start of its slot (Unix seconds, UTC).
     pub slot: u64,
     pub snr_db: f32,
@@ -68,9 +68,10 @@ pub struct Ft8Status {
     pub delay_s: f64,
 }
 
-/// Shared between the UI and the worker.
-#[derive(Clone, Default)]
+/// Shared between the UI and the worker of one protocol.
+#[derive(Clone)]
 pub struct Ft8 {
+    pub protocol: &'static Protocol,
     /// Dial frequency in the receiver's own frequencies (Hz); None switches decoding off.
     dial: Arc<Mutex<Option<f64>>>,
     messages: Arc<Mutex<Vec<Ft8Message>>>,
@@ -85,6 +86,16 @@ fn now_utc() -> f64 {
 }
 
 impl Ft8 {
+    pub fn new(protocol: &'static Protocol) -> Self {
+        Self {
+            protocol,
+            dial: Arc::default(),
+            messages: Arc::default(),
+            status: Arc::default(),
+            starts: Arc::default(),
+        }
+    }
+
     pub fn set_dial(&self, dial: Option<f64>) {
         *self.dial.lock().unwrap() = dial;
     }
@@ -104,14 +115,15 @@ impl Ft8 {
     /// Runs until the source stops.
     pub fn spawn(&self, blocks: Receiver<Block>) {
         let me = self.clone();
-        thread::Builder::new().name("ft8".into()).spawn(move || run(blocks, me)).expect("ft8 thread");
+        thread::Builder::new().name(self.protocol.name.to_lowercase()).spawn(move || run(blocks, me)).expect("ft8/ft4 thread");
     }
 }
 
-/// The stream brought down to RATE around one centre frequency.
+/// The stream brought down to `out_rate` around one centre frequency.
 struct Downconverter {
     center: f64,
     input_rate: f64,
+    out_rate: f64,
     mixer: Mixer,
     halfbands: Vec<FirDecimator<Complex<f32>>>,
     filter: FirDecimator<Complex<f32>>,
@@ -122,10 +134,10 @@ struct Downconverter {
 }
 
 impl Downconverter {
-    fn new(center: f64, block: &Block) -> Self {
+    fn new(center: f64, block: &Block, out_rate: f64) -> Self {
         let mut rate = block.sample_rate;
         let mut halfbands = Vec::new();
-        while rate / 2.0 >= 2.0 * RATE {
+        while rate / 2.0 >= 2.0 * out_rate {
             halfbands.push(halfband());
             rate /= 2.0;
         }
@@ -133,6 +145,7 @@ impl Downconverter {
         Self {
             center,
             input_rate: block.sample_rate,
+            out_rate,
             mixer: Mixer::new(block.center_hz - center, block.sample_rate),
             halfbands,
             filter,
@@ -159,8 +172,9 @@ impl Downconverter {
         }
         let mut b = Vec::with_capacity(a.len());
         self.filter.process(&a, &mut b);
-        // Linear interpolation to exactly RATE (the band is filtered well inside it).
-        let step = self.rate / RATE;
+        // Linear interpolation to exactly the output rate (the band is filtered well
+        // inside it).
+        let step = self.rate / self.out_rate;
         for &x in &b {
             while self.pos < 1.0 {
                 out.push(self.prev + (x - self.prev) * self.pos as f32);
@@ -173,12 +187,16 @@ impl Downconverter {
 }
 
 fn run(blocks: Receiver<Block>, me: Ft8) {
+    let p = me.protocol;
+    let rate = p.rate;
+    // Length of a transmission: a slot holding less of it is not decoded.
+    let duration = p.symbols as f64 * p.sps as f64 / rate;
     let book = Arc::new(Mutex::new(CallBook::default()));
     let mut down: Option<Downconverter> = None;
     let mut buffer: VecDeque<Complex<f32>> = VecDeque::new();
     // UTC time of buffer[0].
     let mut buffer_start = 0.0f64;
-    let mut decoded_slot: Option<u64> = None;
+    let mut decoded_slot: Option<f64> = None;
     let mut chunk = Vec::new();
     loop {
         let block = match blocks.recv_timeout(Duration::from_millis(500)) {
@@ -204,7 +222,7 @@ fn run(blocks: Receiver<Block>, me: Ft8) {
         match down.as_mut() {
             Some(d) if d.input_rate == block.sample_rate && (d.center - center).abs() < MAX_FOLLOW_HZ => d.retarget(center),
             _ => {
-                down = Some(Downconverter::new(center, &block));
+                down = Some(Downconverter::new(center, &block, rate));
                 buffer.clear();
             }
         }
@@ -217,7 +235,7 @@ fn run(blocks: Receiver<Block>, me: Ft8) {
         // SDR's and the computer's clocks differ (the stream ran at 99.8 % of nominal);
         // only a jump of seconds (a stall, a clock change) starts over.
         buffer.extend(chunk.iter().copied());
-        let estimate = arrived - buffer.len() as f64 / RATE;
+        let estimate = arrived - buffer.len() as f64 / rate;
         if buffer.len() == chunk.len() || (estimate - buffer_start).abs() > MAX_TIME_JUMP_S {
             buffer.clear();
             buffer.extend(chunk.iter().copied());
@@ -225,26 +243,26 @@ fn run(blocks: Receiver<Block>, me: Ft8) {
         } else {
             buffer_start += (estimate - buffer_start) * TIME_FOLLOW;
         }
-        let excess = buffer.len().saturating_sub((KEEP_S * RATE) as usize);
+        let excess = buffer.len().saturating_sub((KEEP_S * rate) as usize);
         if excess > 0 {
             buffer.drain(..excess);
-            buffer_start += excess as f64 / RATE;
+            buffer_start += excess as f64 / rate;
         }
 
         // Decode a slot once DECODE_AT_S of it has arrived, counting from where the
         // transmissions actually begin (the learned delay later than the clock's slot).
         let delay = me.status.lock().unwrap().delay_s;
-        let latest = buffer_start + buffer.len() as f64 / RATE;
-        let slot = ((latest - delay - DECODE_AT_S) / SLOT_SECONDS).floor() * SLOT_SECONDS;
+        let latest = buffer_start + buffer.len() as f64 / rate;
+        let slot = ((latest - delay - p.decode_at_s) / p.slot_s).floor() * p.slot_s;
         // A learned delay that grows can make the same slot (or an earlier one) come round
         // again: only later slots are taken.
-        if slot <= 0.0 || decoded_slot.is_some_and(|d| slot as u64 <= d) || latest < slot + delay + DECODE_AT_S {
+        if slot <= 0.0 || decoded_slot.is_some_and(|d| slot <= d) || latest < slot + delay + p.decode_at_s {
             continue;
         }
-        decoded_slot = Some(slot as u64);
-        // From EARLY_S before the slot, for senders whose clocks run ahead.
-        let first = ((slot + delay - decode::EARLY_S - buffer_start) * RATE).round() as isize;
-        let count = ((decode::EARLY_S + DECODE_AT_S) * RATE) as usize;
+        decoded_slot = Some(slot);
+        // From early_s before the slot, for senders whose clocks run ahead.
+        let first = ((slot + delay - p.early_s - buffer_start) * rate).round() as isize;
+        let count = ((p.early_s + p.decode_at_s) * rate) as usize;
         // Slot samples; missing ones (before the buffer began) are zero.
         let samples: Vec<Complex<f32>> = (0..count as isize)
             .map(|i| {
@@ -253,22 +271,24 @@ fn run(blocks: Receiver<Block>, me: Ft8) {
             })
             .collect();
         // Seconds of the slot itself (from its start) that arrived.
-        let missing = ((-first).max(0) as f64 / RATE - decode::EARLY_S).max(0.0);
-        let coverage = DECODE_AT_S - missing;
-        if coverage < START_SECONDS + 12.0 {
+        let missing = ((-first).max(0) as f64 / rate - p.early_s).max(0.0);
+        let coverage = p.decode_at_s - missing;
+        if coverage < p.start_s + duration {
             // Not enough of the slot to hold a whole transmission.
             continue;
         }
         let (me2, book2) = (me.clone(), book.clone());
-        let slot_secs = slot as u64;
+        // Whole seconds, as WSJT-X shows them (an FT4 slot at :07.5 is :07).
+        let slot_secs = (slot + 1e-6).floor() as u64;
         thread::spawn(move || {
-            save_slot(&samples, slot_secs);
+            save_slot(p, &samples, slot_secs);
             let lo = AUDIO_RANGE_HZ.0 - CENTER_ABOVE_DIAL_HZ;
             let hi = AUDIO_RANGE_HZ.1 - CENTER_ABOVE_DIAL_HZ;
-            let found = decode::decode_slot(&samples, lo, hi, &mut book2.lock().unwrap());
+            let found = decode::decode_slot(p, &samples, lo, hi, &mut book2.lock().unwrap());
             let mut messages = me2.messages.lock().unwrap();
             for d in &found {
                 messages.push(Ft8Message {
+                    mode: p.name,
                     slot: slot_secs,
                     snr_db: d.snr_db,
                     dt_s: d.dt_s,
@@ -307,9 +327,9 @@ fn run(blocks: Receiver<Block>, me: Ft8) {
 /// Slots kept on disk for diagnosis.
 const KEEP_SLOTS: usize = 10;
 
-/// Folder of the saved slots (Windows: %LOCALAPPDATA%\SeDiR\ft8).
-pub fn slot_dir() -> Option<std::path::PathBuf> {
-    crate::classify::analysis_dir().and_then(|d| d.parent().map(|p| p.join("ft8")))
+/// Folder of a protocol's saved slots (Windows: %LOCALAPPDATA%\SeDiR\ft8 or \ft4).
+pub fn slot_dir(p: &Protocol) -> Option<std::path::PathBuf> {
+    crate::classify::analysis_dir().and_then(|d| d.parent().map(|dir| dir.join(p.name.to_lowercase())))
 }
 
 /// Slots with a disturbance kept apart, for longer.
@@ -340,11 +360,11 @@ fn write_slot(dir: &std::path::Path, samples: &[Complex<f32>], slot: u64, keep: 
     }
 }
 
-/// Writes a slot's baseband (cf32 at RATE, the dial 1600 Hz below its centre, from
-/// `EARLY_S` before the slot) so that missed decodes can be studied; the last
+/// Writes a slot's baseband (cf32 at the protocol's rate, the dial 1600 Hz below its
+/// centre, from `early_s` before the slot) so that missed decodes can be studied; the last
 /// `KEEP_SLOTS` are kept, and slots with a noise burst also go to `events`.
-fn save_slot(samples: &[Complex<f32>], slot: u64) {
-    let Some(dir) = slot_dir() else { return };
+fn save_slot(p: &Protocol, samples: &[Complex<f32>], slot: u64) {
+    let Some(dir) = slot_dir(p) else { return };
     write_slot(&dir, samples, slot, KEEP_SLOTS);
     if has_burst(samples) {
         write_slot(&dir.join("events"), samples, slot, KEEP_EVENTS);
@@ -374,6 +394,25 @@ pub const DIALS: &[(f64, &str)] = &[
     (144.174e6, "2 m"),
     (432.174e6, "70 cm"),
 ];
+
+/// Usual FT4 dial frequencies (Hz), as WSJT-X lists them.
+pub const FT4_DIALS: &[(f64, &str)] = &[
+    (3.575e6, "80 m"),
+    (7.0475e6, "40 m"),
+    (10.140e6, "30 m"),
+    (14.080e6, "20 m"),
+    (18.104e6, "17 m"),
+    (21.140e6, "15 m"),
+    (24.919e6, "12 m"),
+    (28.180e6, "10 m"),
+    (50.318e6, "6 m"),
+    (144.170e6, "2 m"),
+];
+
+/// Dial list of a protocol.
+pub fn dials(p: &Protocol) -> &'static [(f64, &'static str)] {
+    if p.name == "FT4" { FT4_DIALS } else { DIALS }
+}
 
 #[cfg(test)]
 mod tests {
@@ -406,7 +445,7 @@ mod tests {
         }
         let correction = correction.expect("beacon lock");
         println!("LNB correction {correction:+.0} Hz");
-        let ft8 = Ft8::default();
+        let ft8 = Ft8::new(&crate::ft8::FT8);
         let (tx, rx) = std::sync::mpsc::sync_channel(32);
         handle.commands.send(Command::Subscribe(10, tx)).unwrap();
         ft8.spawn(rx);
@@ -448,11 +487,12 @@ mod tests {
         let rate = 2.4e6;
         let center_rf = 100e6;
         let dial = center_rf + 300e3;
-        // Build the FT8 baseband at RATE, then put it up into the wide band.
+        // Build the FT8 baseband at its rate, then put it up into the wide band.
+        let ft8_rate = crate::ft8::FT8.rate;
         let n = crate::ft8::decode::tests::slot_len();
         let mut base = noise(n, 0.05, 3);
         add_signal(&mut base, "CQ TA4SO KM46", 1500.0 - CENTER_ABOVE_DIAL_HZ, 0.5, amplitude(0.0) * 0.05);
-        let up = (rate / RATE) as usize;
+        let up = (rate / ft8_rate) as usize;
         let offset = dial + CENTER_ABOVE_DIAL_HZ - center_rf;
         let mut wide = Vec::with_capacity(n * up);
         let mut phase = 0.0f64;
@@ -462,14 +502,14 @@ mod tests {
                 phase += 2.0 * std::f64::consts::PI * offset / rate;
             }
         }
-        let mut d = Downconverter::new(dial + CENTER_ABOVE_DIAL_HZ, &Block { samples: Arc::new(Vec::new()), center_hz: center_rf, sample_rate: rate });
+        let mut d = Downconverter::new(dial + CENTER_ABOVE_DIAL_HZ, &Block { samples: Arc::new(Vec::new()), center_hz: center_rf, sample_rate: rate }, ft8_rate);
         let mut out = Vec::new();
         for c in wide.chunks(48_000) {
             d.process(&Block { samples: Arc::new(c.to_vec()), center_hz: center_rf, sample_rate: rate }, &mut out);
         }
         assert!((out.len() as f64 - n as f64).abs() < 50.0, "{} samples", out.len());
         // The filters delay the stream by a few ms; the decoder searches the start anyway.
-        let found = decode::decode_slot(&out, -1500.0, 1500.0, &mut CallBook::default());
+        let found = decode::decode_slot(&crate::ft8::FT8, &out, -1500.0, 1500.0, &mut CallBook::default());
         println!("{found:?}");
         let d = found.iter().find(|d| d.text == "CQ TA4SO KM46").expect("decoded");
         assert!((d.freq_hz + CENTER_ABOVE_DIAL_HZ - 1500.0).abs() < 4.0);

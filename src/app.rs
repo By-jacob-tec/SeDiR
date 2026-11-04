@@ -14,7 +14,8 @@ use sedir::demod::Mode;
 use sedir::detect::{self, Signal};
 use sedir::device::{self, DeviceInfo, DeviceKind, FreqCheck, Limits};
 use sedir::freq;
-use sedir::ft8::worker::{DIALS, Ft8};
+use sedir::ft8::worker::{DIALS, FT4_DIALS, Ft8, Ft8Message, dials};
+use sedir::ft8::{FT4, FT8};
 use sedir::listen::{ListenSettings, Listener};
 use sedir::radio::Tuning;
 use sedir::rds::RdsInfo;
@@ -49,10 +50,24 @@ const SCAN_ID: u32 = 2;
 const CLASSIFY_ID: u32 = 3;
 /// Subscriber id of the beacon tracker.
 const BEACON_ID: u32 = 4;
-/// Subscriber id of the FT8 decoder.
-const FT8_ID: u32 = 5;
-/// Audio range of FT8 above its dial frequency (Hz), shaded on the spectrum.
+/// Subscriber ids of the FT8 and FT4 decoders.
+const FT_IDS: [u32; 2] = [5, 6];
+/// Audio range of FT8/FT4 above the dial frequency (Hz), shaded on the spectrum.
 const FT8_AUDIO_HZ: (f64, f64) = (100.0, 3100.0);
+
+/// One of the slot decoders (FT8, FT4) with its switch and dial frequency.
+struct FtDecoder {
+    worker: Ft8,
+    on: bool,
+    /// Dial frequency (radio frequency, Hz).
+    dial_hz: f64,
+}
+
+impl FtDecoder {
+    fn name(&self) -> &'static str {
+        self.worker.protocol.name
+    }
+}
 /// Converter LO of a QO-100 LNB: the beacon can be followed with it.
 const QO100_LO_HZ: f64 = 9_750e6;
 /// Signals at least this wide and this far above the noise, inside the FM broadcast
@@ -101,10 +116,8 @@ pub struct SedirApp {
     correction_hz: f64,
     beacon_lock: bool,
     beacon: Option<SharedBeacon>,
-    ft8: Ft8,
-    ft8_on: bool,
-    /// FT8 dial frequency (radio frequency, Hz).
-    ft8_dial_hz: f64,
+    /// FT8 and FT4.
+    ft: [FtDecoder; 2],
     sample_rate: f64,
     gain_db: f64,
     auto_gain: bool,
@@ -163,9 +176,18 @@ impl SedirApp {
         let beacon_lock = settings.beacon_lock.unwrap_or(true);
         let auto_mode = settings.auto_mode.unwrap_or(true);
         let mut app = Self {
-            ft8: Ft8::default(),
-            ft8_on: settings.ft8_on.unwrap_or(false),
-            ft8_dial_hz: settings.ft8_dial_hz.unwrap_or(DIALS[0].0),
+            ft: [
+                FtDecoder {
+                    worker: Ft8::new(&FT8),
+                    on: settings.ft8_on.unwrap_or(false),
+                    dial_hz: settings.ft8_dial_hz.unwrap_or(DIALS[0].0),
+                },
+                FtDecoder {
+                    worker: Ft8::new(&FT4),
+                    on: settings.ft4_on.unwrap_or(false),
+                    dial_hz: settings.ft4_dial_hz.unwrap_or(FT4_DIALS[3].0),
+                },
+            ],
             correction_hz,
             beacon_lock,
             beacon: None,
@@ -340,9 +362,11 @@ impl SedirApp {
         let (tx, rx) = mpsc::sync_channel(LISTEN_QUEUE);
         self.send(Command::Subscribe(SCAN_ID, tx));
         self.stations.spawn_scanner(rx);
-        let (tx, rx) = mpsc::sync_channel(LISTEN_QUEUE);
-        self.send(Command::Subscribe(FT8_ID, tx));
-        self.ft8.spawn(rx);
+        for k in 0..self.ft.len() {
+            let (tx, rx) = mpsc::sync_channel(LISTEN_QUEUE);
+            self.send(Command::Subscribe(FT_IDS[k], tx));
+            self.ft[k].worker.spawn(rx);
+        }
         if self.audio.is_none() {
             self.open_audio();
         }
@@ -821,58 +845,77 @@ impl SedirApp {
         }
     }
 
+    fn save_ft(&mut self, k: usize) {
+        let (on, dial) = (Some(self.ft[k].on), Some(self.ft[k].dial_hz));
+        if k == 0 {
+            (self.settings.ft8_on, self.settings.ft8_dial_hz) = (on, dial);
+        } else {
+            (self.settings.ft4_on, self.settings.ft4_dial_hz) = (on, dial);
+        }
+        self.settings.save();
+    }
+
     fn digital_card(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
-        if ui.checkbox(&mut self.ft8_on, t.ft8_decode).on_hover_text(t.ft8_tooltip).changed() {
-            self.settings.ft8_on = Some(self.ft8_on);
-            self.settings.save();
-        }
-        ui.horizontal(|ui| {
-            ui.label(t.ft8_dial);
-            let current = DIALS.iter().find(|d| d.0 == self.ft8_dial_hz).map_or_else(|| mhz_text(self.ft8_dial_hz), |d| d.1.to_string());
-            let mut dial = self.ft8_dial_hz;
-            egui::ComboBox::from_id_salt("ft8_dial").selected_text(current).show_ui(ui, |ui| {
-                for &(hz, name) in DIALS {
-                    ui.selectable_value(&mut dial, hz, format!("{name} · {}", freq::short(hz)));
+        for k in 0..self.ft.len() {
+            if k > 0 {
+                ui.add_space(6.0);
+            }
+            let name = self.ft[k].name();
+            let slot = format!("{}", self.ft[k].worker.protocol.slot_s);
+            if ui.checkbox(&mut self.ft[k].on, fill(t.ft8_decode, &[&name])).on_hover_text(fill(t.ft8_tooltip, &[&slot])).changed() {
+                self.save_ft(k);
+            }
+            ui.horizontal(|ui| {
+                ui.label(t.ft8_dial);
+                let list = dials(self.ft[k].worker.protocol);
+                let old = self.ft[k].dial_hz;
+                let current = list.iter().find(|d| d.0 == old).map_or_else(|| mhz_text(old), |d| d.1.to_string());
+                let mut dial = old;
+                egui::ComboBox::from_id_salt(("ft_dial", k)).selected_text(current).show_ui(ui, |ui| {
+                    for &(hz, name) in list {
+                        ui.selectable_value(&mut dial, hz, format!("{name} · {}", freq::short(hz)));
+                    }
+                });
+                let mut mhz = dial / 1e6;
+                if ui.add(egui::DragValue::new(&mut mhz).speed(0.001).max_decimals(4).suffix(" MHz")).changed() {
+                    dial = (mhz * 1e6).round();
+                }
+                if dial != old {
+                    self.ft[k].dial_hz = dial;
+                    self.ft[k].worker.clear();
+                    self.save_ft(k);
+                }
+                if ui.button(t.ft8_listen).clicked() {
+                    self.set_mode(Mode::Usb);
+                    self.bandwidth_hz = 2.8e3;
+                    self.set_vfo(dial);
                 }
             });
-            let mut mhz = dial / 1e6;
-            if ui.add(egui::DragValue::new(&mut mhz).speed(0.001).max_decimals(4).suffix(" MHz")).changed() {
-                dial = (mhz * 1e6).round();
-            }
-            if dial != self.ft8_dial_hz {
-                self.ft8_dial_hz = dial;
-                self.ft8.clear();
-                self.settings.ft8_dial_hz = Some(dial);
-                self.settings.save();
-            }
-        });
-        if ui.button(t.ft8_listen).clicked() {
-            self.set_mode(Mode::Usb);
-            self.bandwidth_hz = 2.8e3;
-            self.set_vfo(self.ft8_dial_hz);
-        }
-        if self.ft8_on && self.opened {
-            let half = self.sample_rate / 2.0;
-            let inside = (self.center_hz - half..self.center_hz + half).contains(&self.ft8_dial_hz);
-            if !inside {
-                ui.label(RichText::new(t.ft8_outside).size(12.0).color(WARN));
+            if self.ft[k].on && self.opened {
+                let half = self.sample_rate / 2.0;
+                let inside = (self.center_hz - half..self.center_hz + half).contains(&self.ft[k].dial_hz);
+                if !inside {
+                    ui.label(RichText::new(t.ft8_outside).size(12.0).color(WARN));
+                }
             }
         }
     }
 
-    /// Decoded FT8 messages, newest at the bottom.
-    fn ft8_panel(&mut self, ui: &mut egui::Ui) {
+    /// Status line of one slot decoder above the message list.
+    fn ft_status(&mut self, ui: &mut egui::Ui, k: usize) {
         let t = self.t();
-        let status = self.ft8.status();
+        let d = &self.ft[k];
+        let p = d.worker.protocol;
+        let status = d.worker.status();
         ui.horizontal(|ui| {
-            let badge = egui::Button::new(RichText::new("FT8").size(11.0).strong().color(DEEP)).fill(ACCENT).corner_radius(4).sense(Sense::hover());
-            ui.add(badge).on_hover_text(t.ft8_tooltip);
-            ui.label(RichText::new(mhz_text(self.ft8_dial_hz)).size(12.0).monospace().color(MUTED));
+            let badge = egui::Button::new(RichText::new(p.name).size(11.0).strong().color(DEEP)).fill(ft_color(k)).corner_radius(4).sense(Sense::hover());
+            ui.add(badge).on_hover_text(fill(t.ft8_tooltip, &[&format!("{}", p.slot_s)]));
+            ui.label(RichText::new(mhz_text(d.dial_hz)).size(12.0).monospace().color(MUTED));
             let text = match status.last_slot {
                 Some(slot) => {
                     let mut s = fill(t.ft8_last, &[&utc_hms(slot), &status.last_count]);
-                    if status.coverage_s < 13.5 {
+                    if status.coverage_s < p.decode_at_s - 0.5 {
                         s += &format!(" · {}", fill(t.ft8_partial, &[&format!("{:.1}", status.coverage_s)]));
                     }
                     s
@@ -886,26 +929,52 @@ impl SedirApp {
             }
             // Seconds left in the current slot.
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
-            let left = 15.0 - now % 15.0;
+            let left = p.slot_s - now % p.slot_s;
             ui.label(RichText::new(format!("{left:>4.1} s")).size(12.0).monospace().color(MUTED));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button(t.ft8_clear).clicked() {
-                    self.ft8.clear();
-                }
-            });
+            if k == 0 || !self.ft[0].on {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button(t.ft8_clear).clicked() {
+                        for d in &self.ft {
+                            d.worker.clear();
+                        }
+                    }
+                });
+            }
         });
-        let messages = self.ft8.messages();
+    }
+
+    /// Decoded FT8 and FT4 messages together, newest at the bottom.
+    fn ft8_panel(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        for k in 0..self.ft.len() {
+            if self.ft[k].on {
+                self.ft_status(ui, k);
+            }
+        }
+        let mut messages: Vec<Ft8Message> = self.ft.iter().filter(|d| d.on).flat_map(|d| d.worker.messages()).collect();
+        // By slot start; FT8 and FT4 slots interleave. Stable, so each slot keeps its order.
+        messages.sort_by_key(|m| m.slot);
+        let both = self.ft.iter().all(|d| d.on);
         egui::ScrollArea::vertical().max_height(ui.available_height()).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-            egui::Grid::new("ft8_messages").num_columns(5).spacing(vec2(14.0, 2.0)).striped(true).show(ui, |ui| {
-                for h in ["UTC", "dB", "DT", "Hz", t.ft8_message] {
+            egui::Grid::new("ft8_messages").num_columns(if both { 6 } else { 5 }).spacing(vec2(14.0, 2.0)).striped(true).show(ui, |ui| {
+                let mut heads = vec!["UTC", "dB", "DT", "Hz", t.ft8_message];
+                if both {
+                    heads.insert(0, t.ft_mode);
+                }
+                for h in heads {
                     ui.label(RichText::new(h).size(11.0).strong().color(MUTED));
                 }
                 ui.end_row();
-                let latest = messages.last().map(|m| m.slot);
+                let latest = |mode: &str| messages.iter().rev().find(|m| m.mode == mode).map(|m| m.slot);
+                let latest = [latest(FT8.name), latest(FT4.name)];
                 for m in &messages {
-                    let fresh = Some(m.slot) == latest;
+                    let k = usize::from(m.mode == FT4.name);
+                    let fresh = Some(m.slot) == latest[k];
                     let color = if m.text.starts_with("CQ ") { GOOD } else if fresh { TEXT } else { MUTED };
                     let mono = |s: String| RichText::new(s).size(13.0).monospace().color(color);
+                    if both {
+                        ui.label(RichText::new(m.mode).size(11.0).strong().color(ft_color(k)));
+                    }
                     ui.label(mono(utc_hms(m.slot)));
                     ui.label(mono(format!("{:+3.0}", m.snr_db)));
                     ui.label(mono(format!("{:+.1}", m.dt_s)));
@@ -1331,13 +1400,14 @@ impl SedirApp {
             }
         }
 
-        // The FT8 band (audio 100–3100 Hz above the dial).
-        if self.ft8_on {
-            let (a, b) = (x_of(self.ft8_dial_hz + FT8_AUDIO_HZ.0), x_of(self.ft8_dial_hz + FT8_AUDIO_HZ.1));
+        // The FT8/FT4 bands (audio 100–3100 Hz above the dial).
+        for (k, d) in self.ft.iter().enumerate().filter(|(_, d)| d.on) {
+            let (a, b) = (x_of(d.dial_hz + FT8_AUDIO_HZ.0), x_of(d.dial_hz + FT8_AUDIO_HZ.1));
             if b > full.left() && a < full.right() {
+                let color = ft_color(k);
                 let band = Rect::from_x_y_ranges(a.max(full.left())..=b.min(full.right()), spec_rect.bottom() - 6.0..=spec_rect.bottom());
-                painter.rect_filled(band, CornerRadius::ZERO, ACCENT.gamma_multiply(0.7));
-                painter.text(pos2(a.max(full.left()) + 3.0, spec_rect.bottom() - 8.0), Align2::LEFT_BOTTOM, "FT8", FontId::proportional(10.0), ACCENT);
+                painter.rect_filled(band, CornerRadius::ZERO, color.gamma_multiply(0.7));
+                painter.text(pos2(a.max(full.left()) + 3.0, spec_rect.bottom() - 8.0), Align2::LEFT_BOTTOM, d.name(), FontId::proportional(10.0), color);
             }
         }
 
@@ -1523,8 +1593,11 @@ impl eframe::App for SedirApp {
         self.poll_classification();
         self.update_beacon_tracker();
         self.sync_listener();
-        // The FT8 decoder works in the receiver's own frequencies.
-        self.ft8.set_dial((self.ft8_on && self.opened).then(|| self.ft8_dial_hz - self.lo()));
+        // The FT8/FT4 decoders work in the receiver's own frequencies.
+        let lo = self.lo();
+        for d in &self.ft {
+            d.worker.set_dial((d.on && self.opened).then(|| d.dial_hz - lo));
+        }
         if self.handle.is_some() {
             // Keeps the signal meter moving between spectrum frames.
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
@@ -1541,7 +1614,7 @@ impl eframe::App for SedirApp {
                 .frame(egui::Frame::new().fill(CARD).inner_margin(egui::Margin::symmetric(14, 6)))
                 .show(ui, |ui| self.rds_bar(ui));
         }
-        if self.ft8_on && self.opened {
+        if self.ft.iter().any(|d| d.on) && self.opened {
             // Drag its top edge to make it taller.
             egui::Panel::bottom("ft8")
                 .resizable(true)
@@ -1604,6 +1677,11 @@ fn level_bar(ui: &mut egui::Ui, db: f32, squelch: Option<f32>) {
 fn volume_gain(percent: f32) -> f32 {
     let v = percent / 100.0;
     v * v * 1.5
+}
+
+/// Badge and band colour of slot decoder `k` (FT8, FT4).
+fn ft_color(k: usize) -> Color32 {
+    if k == 0 { ACCENT } else { AMBER }
 }
 
 /// Unix seconds → "HHMMSS" (UTC), as FT8 programs show slot times.
