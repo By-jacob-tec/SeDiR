@@ -40,6 +40,13 @@ cargo build --release
 sedir --diagnose   # lists the receivers found
 ```
 
+## Credits
+
+FT8 is the work of Joe Taylor K1JT, Steve Franke K9AN, Bill Somerville G4WJS and the
+WSJT-X team. SeDiR's FT8 decoder is its own code, but its LDPC code tables, CRC and
+message encoding are taken from WSJT-X (GPL-3.0); `tools/gen_ft8_tables.sh` regenerates
+the tables. RDS follows IEC 62106.
+
 ## License
 
 GPL-3.0-or-later. A yAtölye project.
