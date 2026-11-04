@@ -407,11 +407,61 @@ pub fn spawn_job(blocks: Receiver<Block>, hz: f64, width_hz: f64, lo_hz: f64) ->
     thread::Builder::new()
         .name("classify".into())
         .spawn(move || {
-            let verdict = collect(blocks, hz, width_hz).and_then(|(samples, rate)| classify_samples(&samples, rate, hz + lo_hz, width_hz));
+            let verdict = collect(blocks, hz, width_hz).and_then(|(samples, rate)| {
+                let c = classify_samples(&samples, rate, hz + lo_hz, width_hz);
+                save_analysis(&samples, rate, hz + lo_hz, width_hz, c.as_ref());
+                c
+            });
             let _ = tx.send(verdict);
         })
         .expect("classify thread");
     rx
+}
+
+/// Recent analyses kept on disk.
+const KEEP_ANALYSES: usize = 20;
+
+/// Folder where the samples of recent analyses are kept, to study wrong verdicts
+/// (Windows: %LOCALAPPDATA%\SeDiR\analysis, elsewhere ~/.cache/sedir/analysis).
+pub fn analysis_dir() -> Option<std::path::PathBuf> {
+    let base = if cfg!(windows) {
+        std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("SeDiR")
+    } else {
+        std::path::PathBuf::from(std::env::var_os("HOME")?).join(".cache").join("sedir")
+    };
+    Some(base.join("analysis"))
+}
+
+/// Writes the analysed samples (cf32_le) and a description of them; the oldest beyond
+/// `KEEP_ANALYSES` are removed. Failures are ignored: this only serves diagnosis.
+fn save_analysis(samples: &[Complex<f32>], rate: f64, center_hz: f64, width_hz: f64, verdict: Option<&Classification>) {
+    let Some(dir) = analysis_dir() else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let name = format!("{stamp}_{:.0}Hz", center_hz);
+    let bytes: Vec<u8> = samples.iter().flat_map(|z| [z.re.to_le_bytes(), z.im.to_le_bytes()].concat()).collect();
+    let _ = std::fs::write(dir.join(format!("{name}.cf32")), bytes);
+    let text = format!("rate={rate}\ncenter_hz={center_hz}\nwidth_hz={width_hz}\nverdict={verdict:?}\n");
+    let _ = std::fs::write(dir.join(format!("{name}.txt")), text);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut files: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "cf32")).collect();
+        files.sort();
+        for old in files.iter().take(files.len().saturating_sub(KEEP_ANALYSES)) {
+            let _ = std::fs::remove_file(old);
+            let _ = std::fs::remove_file(old.with_extension("txt"));
+        }
+    }
+}
+
+/// Reads an analysis saved by `save_analysis`: (samples, rate, center Hz, width Hz).
+pub fn load_analysis(cf32: &std::path::Path) -> Option<(Vec<Complex<f32>>, f64, f64, f64)> {
+    let bytes = std::fs::read(cf32).ok()?;
+    let samples = bytes.chunks_exact(8).map(|c| Complex::new(f32::from_le_bytes(c[0..4].try_into().unwrap()), f32::from_le_bytes(c[4..8].try_into().unwrap()))).collect();
+    let text = std::fs::read_to_string(cf32.with_extension("txt")).ok()?;
+    let field = |key: &str| text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('=')?.parse::<f64>().ok());
+    Some((samples, field("rate")?, field("center_hz")?, field("width_hz")?))
 }
 
 /// Measures and decides, then for SSB places the dial from the voice. `center_hz` is the
@@ -664,6 +714,32 @@ mod tests {
             let result = spawn_job(rx, mhz * 1e6, 150e3, 0.0).recv().unwrap();
             let _ = Reason::VoicePitch;
             println!("{mhz} MHz → {result:?}");
+        }
+    }
+
+    /// Re-analyses the saved analyses with details:
+    /// `cargo test --lib saved_analyses -- --ignored --nocapture` (SEDIR_ANALYSIS=folder to override).
+    #[test]
+    #[ignore]
+    fn saved_analyses() {
+        let dir = std::env::var_os("SEDIR_ANALYSIS").map(std::path::PathBuf::from).or_else(analysis_dir).unwrap();
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "cf32")).collect();
+        files.sort();
+        for path in files {
+            let (samples, rate, center, width) = load_analysis(&path).unwrap();
+            let focus = (width / 2.0 + 300.0).max(500.0);
+            let f = measure(&samples, rate, focus);
+            println!("\n{} · {:.3} kHz rate · center {:.0} Hz · width {width:.0}", path.file_name().unwrap().to_string_lossy(), rate / 1e3, center);
+            println!("  {f:?}");
+            if let Some(f) = f {
+                let d = decide(&f, center);
+                println!("  rough: {:?} {:.0} Hz ({:+.0} from centre)", d.mode, d.frequency_hz, d.frequency_hz - center);
+                if matches!(d.mode, Mode::Usb | Mode::Lsb) {
+                    let r = ssb_pitch_offset(&samples, rate, d.frequency_hz - center, d.mode == Mode::Usb);
+                    println!("  pitch correction: {r:?}");
+                }
+            }
+            println!("  final: {:?}", classify_samples(&samples, rate, center, width));
         }
     }
 
