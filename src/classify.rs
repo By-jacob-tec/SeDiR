@@ -230,19 +230,31 @@ pub fn decide(f: &Features, center_hz: f64) -> Classification {
         let center = abs((f.lo_hz + f.hi_hz) / 2.0);
         (Mode::Nfm, 0.8, Mode::Nfm.round_to_channel(center), (width * 1.3).clamp(8e3, 25e3))
     } else if width <= 4.5e3 {
-        // Single sideband: speech is strongest just beside the suppressed carrier.
-        let upper = match (f.centroid < 0.45, f.centroid > 0.55) {
-            (true, false) => {
+        // Single sideband. The sideband is a convention of the band (LSB below 10 MHz on
+        // the amateur bands, USB above and on QO-100), which the band plan knows; the
+        // spectrum alone is a weak guide, as compressed or pre-emphasised speech is not
+        // reliably strongest beside the carrier (on QO-100 it pointed the wrong way). It
+        // is used only where the band plan says nothing, and only when clear.
+        let upper = match hint {
+            Some(Mode::Usb) => {
+                reasons.push(Reason::BandPlan);
+                true
+            }
+            Some(Mode::Lsb) => {
+                reasons.push(Reason::BandPlan);
+                false
+            }
+            _ if f.centroid < 0.3 => {
                 reasons.push(Reason::VoiceAboveCarrier);
                 true
             }
-            (false, true) => {
+            _ if f.centroid > 0.7 => {
                 reasons.push(Reason::VoiceBelowCarrier);
                 false
             }
             _ => {
                 reasons.push(Reason::BandPlan);
-                hint != Some(Mode::Lsb) && center_hz >= 10e6
+                center_hz >= 10e6
             }
         };
         let bw = (width + 150.0).clamp(1.8e3, 3.6e3);
@@ -392,6 +404,25 @@ mod tests {
         );
         assert_eq!(c.mode, Mode::Usb);
         assert!((c.frequency_hz - 14.2e6).abs() < 200.0, "dial {}", c.frequency_hz);
+    }
+
+    #[test]
+    fn qo100_ssb_is_usb_even_with_bright_speech() {
+        // Compressed, pre-emphasised speech: stronger towards the treble, which made the
+        // spectrum look like LSB on the satellite.
+        let c = classify(
+            |t| {
+                (0..12)
+                    .map(|k| {
+                        let f = 300.0 + k as f64 * 200.0;
+                        Complex::from_polar((0.02 * (1.0 + k as f64)) as f32, (2.0 * PI * f * t + k as f64) as f32)
+                    })
+                    .sum()
+            },
+            10489.75e6,
+        );
+        assert_eq!(c.mode, Mode::Usb);
+        assert!((c.frequency_hz - 10489.75e6).abs() < 200.0, "dial {}", c.frequency_hz);
     }
 
     #[test]
