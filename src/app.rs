@@ -42,8 +42,8 @@ const STEPS: [f64; 12] = [1.0, 10.0, 100.0, 500.0, 1e3, 2.5e3, 5e3, 6.25e3, 10e3
 const MIN_SPAN: f64 = 5e3;
 /// Window width (points) from which the settings are laid out in two columns.
 const WIDE_WINDOW: f32 = 1700.0;
-/// Text and control size at first start; 1.0 is small on large screens.
-const DEFAULT_ZOOM: f32 = 1.25;
+/// Narrowest window (points) that still leaves the spectrum some room beside two columns.
+const TWO_COLUMNS_MIN: f32 = 1250.0;
 const ZOOM_STEP: f32 = 0.1;
 const ZOOM_RANGE: (f32, f32) = (0.7, 2.5);
 /// Subscriber id of the listening thread at the source.
@@ -96,6 +96,10 @@ struct FrameInfo {
 
 pub struct SedirApp {
     lang: Lang,
+    /// Text size is chosen (saved, or picked from the screen size on the first frames).
+    zoom_ready: bool,
+    /// Height (points) the settings cards took last frame, all columns together.
+    cards_height: f32,
     settings: Settings,
 
     devices: Vec<DeviceInfo>,
@@ -171,7 +175,9 @@ impl SedirApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_theme(&cc.egui_ctx);
         let settings = Settings::load();
-        cc.egui_ctx.set_zoom_factor(settings.zoom.unwrap_or(DEFAULT_ZOOM).clamp(ZOOM_RANGE.0, ZOOM_RANGE.1));
+        if let Some(z) = settings.zoom {
+            cc.egui_ctx.set_zoom_factor(z.clamp(ZOOM_RANGE.0, ZOOM_RANGE.1));
+        }
         let center = settings.frequency_hz.unwrap_or(DEFAULT_FREQUENCY);
         let limits = DeviceKind::Other.limits();
         let mode = settings.mode.as_deref().and_then(Mode::from_name).unwrap_or(Mode::Nfm);
@@ -225,6 +231,8 @@ impl SedirApp {
             audio_error: None,
             logo_tex: cc.egui_ctx.load_texture("logo", logo, TextureOptions::LINEAR),
             lang: settings.lang.unwrap_or_else(Lang::from_system),
+            zoom_ready: settings.zoom.is_some(),
+            cards_height: 0.0,
             threshold_db: settings.threshold_db.unwrap_or(DEFAULT_THRESHOLD_DB),
             settings,
             devices: Vec::new(),
@@ -794,10 +802,12 @@ impl SedirApp {
     // ---- Left panel ----
 
     /// Cards `cards` (indices into receiver, frequency, listen, audio, digital, view).
-    fn sidebar(&mut self, ui: &mut egui::Ui, cards: std::ops::Range<usize>) {
+    /// Returns the height the cards took.
+    fn sidebar(&mut self, ui: &mut egui::Ui, cards: &[usize]) -> f32 {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let t = self.t();
-            for i in cards {
+            let top = ui.cursor().top();
+            for &i in cards {
                 match i {
                     0 => card(ui, t.card_receiver, |ui| self.receiver_card(ui)),
                     1 => card(ui, t.card_frequency, |ui| self.frequency_card(ui)),
@@ -807,7 +817,9 @@ impl SedirApp {
                     _ => card(ui, t.card_view, |ui| self.view_card(ui)),
                 }
             }
-        });
+            ui.cursor().top() - top
+        })
+        .inner
     }
 
     fn listen_card(&mut self, ui: &mut egui::Ui) {
@@ -1633,11 +1645,27 @@ impl SedirApp {
 
 impl eframe::App for SedirApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Keeps the text size, whether set with the buttons or Ctrl +/−.
-        let zoom = (ui.ctx().zoom_factor() * 100.0).round() / 100.0;
-        if self.settings.zoom.unwrap_or(DEFAULT_ZOOM) != zoom {
-            self.settings.zoom = Some(zoom);
-            self.settings.save();
+        if !self.zoom_ready {
+            // First start: a text size to suit the screen, once its size is known.
+            let screen = ui.input(|i| {
+                let v = i.viewport();
+                v.monitor_size.zip(v.native_pixels_per_point).map(|(size, native)| size * i.pixels_per_point() / native)
+            });
+            if let Some(screen) = screen {
+                ui.ctx().set_zoom_factor(default_zoom(screen.y));
+                self.zoom_ready = true;
+            } else if ui.ctx().cumulative_frame_nr() > 10 {
+                self.zoom_ready = true;
+            } else {
+                ui.ctx().request_repaint();
+            }
+        } else {
+            // Keeps the text size, whether set with the buttons or Ctrl +/−.
+            let zoom = (ui.ctx().zoom_factor() * 100.0).round() / 100.0;
+            if self.settings.zoom != Some(zoom) {
+                self.settings.zoom = Some(zoom);
+                self.settings.save();
+            }
         }
         self.poll_discovery();
         self.poll_events();
@@ -1659,18 +1687,23 @@ impl eframe::App for SedirApp {
         egui::Panel::bottom("status")
             .frame(egui::Frame::new().fill(DEEP).inner_margin(egui::Margin::symmetric(12, 4)))
             .show(ui, |ui| self.status_bar(ui));
-        // The settings run the full height beside the spectrum; on a wide window in two
-        // columns, so all cards are in view without scrolling.
+        // The settings run the full height beside the spectrum. In two columns when the
+        // window is wide, or when one column would not fit in its height and there is
+        // room beside the spectrum; otherwise one column that scrolls.
         let side = egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(10));
-        if ui.available_width() >= WIDE_WINDOW {
-            egui::Panel::left("sidebar_a").resizable(true).default_size(310.0).size_range(270.0..=440.0).frame(side)
-                .show(ui, |ui| self.sidebar(ui, 0..3));
-            egui::Panel::left("sidebar_b").resizable(true).default_size(310.0).size_range(270.0..=440.0)
+        let width = ui.available_width();
+        let overflows = self.cards_height > ui.available_height() - 20.0;
+        if width >= WIDE_WINDOW || (overflows && width >= TWO_COLUMNS_MIN) {
+            let a = egui::Panel::left("sidebar_a").resizable(true).default_size(310.0).size_range(270.0..=440.0).frame(side)
+                .show(ui, |ui| self.sidebar(ui, &[0, 1, 5]));
+            let b = egui::Panel::left("sidebar_b").resizable(true).default_size(310.0).size_range(270.0..=440.0)
                 .frame(side.inner_margin(egui::Margin { left: 0, ..egui::Margin::same(10) }))
-                .show(ui, |ui| self.sidebar(ui, 3..6));
+                .show(ui, |ui| self.sidebar(ui, &[2, 3, 4]));
+            self.cards_height = a.inner + b.inner;
         } else {
-            egui::Panel::left("sidebar").resizable(true).default_size(310.0).size_range(270.0..=440.0).frame(side)
-                .show(ui, |ui| self.sidebar(ui, 0..6));
+            self.cards_height = egui::Panel::left("sidebar").resizable(true).default_size(310.0).size_range(270.0..=440.0).frame(side)
+                .show(ui, |ui| self.sidebar(ui, &[0, 1, 2, 3, 4, 5]))
+                .inner;
         }
         self.rds = if self.mode == Mode::Wfm && self.opened { self.listener.rds() } else { None };
         if self.mode == Mode::Wfm && self.opened {
@@ -1735,6 +1768,13 @@ fn level_bar(ui: &mut egui::Ui, db: f32, squelch: Option<f32>) {
         painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(2.0, AMBER));
     }
     painter.text(rect.right_center() - vec2(4.0, 0.0), Align2::RIGHT_CENTER, format!("{db:.0} dBFS"), FontId::monospace(10.0), TEXT);
+}
+
+/// Text size for a screen `height` points tall (after the system's own display
+/// scaling): egui's size up to full HD, larger on taller screens (1440 → 125 %),
+/// never smaller, since laptops are already scaled up by the system.
+fn default_zoom(height: f32) -> f32 {
+    ((height / 1150.0).clamp(1.0, 1.5) * 20.0).round() / 20.0
 }
 
 /// Volume percent to a gain factor (squared, which sounds closer to even steps).
@@ -1817,6 +1857,15 @@ fn shift_row(row: &mut [Color32], shift: isize, empty: Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_zoom_follows_screen_height() {
+        // Laptop at 150 % (1080 → 720 points), full HD, 1440p / ultrawide, 4K at 100 %.
+        assert_eq!(default_zoom(720.0), 1.0);
+        assert_eq!(default_zoom(1080.0), 1.0);
+        assert_eq!(default_zoom(1440.0), 1.25);
+        assert_eq!(default_zoom(2160.0), 1.5);
+    }
 
     #[test]
     fn formats_and_steps() {
