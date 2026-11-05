@@ -1434,13 +1434,30 @@ impl SedirApp {
         }
 
         // The FT8/FT4 bands (audio 100–3100 Hz above the dial).
-        for (k, d) in self.ft.iter().enumerate().filter(|(_, d)| d.on) {
-            let (a, b) = (x_of(d.dial_hz + FT8_AUDIO_HZ.0), x_of(d.dial_hz + FT8_AUDIO_HZ.1));
+        // Decoders on the same dial (FT8 and FT4 on QO-100) share one band: stacked
+        // bars and one label, "FT8 / FT4".
+        let on: Vec<usize> = (0..self.ft.len()).filter(|&k| self.ft[k].on).collect();
+        for (i, &k) in on.iter().enumerate() {
+            let dial = self.ft[k].dial_hz;
+            if on[..i].iter().any(|&j| self.ft[j].dial_hz == dial) {
+                continue;
+            }
+            let group: Vec<usize> = on[i..].iter().copied().filter(|&j| self.ft[j].dial_hz == dial).collect();
+            let (a, b) = (x_of(dial + FT8_AUDIO_HZ.0), x_of(dial + FT8_AUDIO_HZ.1));
             if b > full.left() && a < full.right() {
-                let color = ft_color(k);
-                let band = Rect::from_x_y_ranges(a.max(full.left())..=b.min(full.right()), spec_rect.bottom() - 6.0..=spec_rect.bottom());
-                painter.rect_filled(band, CornerRadius::ZERO, color.gamma_multiply(0.7));
-                painter.text(pos2(a.max(full.left()) + 3.0, spec_rect.bottom() - 8.0), Align2::LEFT_BOTTOM, d.name(), FontId::proportional(10.0), color);
+                let x = a.max(full.left())..=b.min(full.right());
+                let h = 6.0 / group.len() as f32;
+                for (n, &j) in group.iter().enumerate() {
+                    let top = spec_rect.bottom() - 6.0 + n as f32 * h;
+                    painter.rect_filled(Rect::from_x_y_ranges(x.clone(), top..=top + h), CornerRadius::ZERO, ft_color(j).gamma_multiply(0.7));
+                }
+                let mut pos = pos2(a.max(full.left()) + 3.0, spec_rect.bottom() - 8.0);
+                for (n, &j) in group.iter().enumerate() {
+                    if n > 0 {
+                        pos.x = painter.text(pos, Align2::LEFT_BOTTOM, " / ", FontId::proportional(10.0), MUTED).right();
+                    }
+                    pos.x = painter.text(pos, Align2::LEFT_BOTTOM, self.ft[j].name(), FontId::proportional(10.0), ft_color(j)).right();
+                }
             }
         }
 
