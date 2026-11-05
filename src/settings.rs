@@ -37,6 +37,9 @@ pub struct Settings {
     /// The same for FT4.
     pub ft4_on: Option<bool>,
     pub ft4_dial_hz: Option<f64>,
+    /// Sample rate chosen for each device (by its arguments): the widest band may be more
+    /// than its link carries (a Pluto on 100 Mbit Ethernet), so the working one is kept.
+    pub device_rates: Vec<(String, f64)>,
 }
 
 fn path() -> Option<PathBuf> {
@@ -51,6 +54,16 @@ fn path() -> Option<PathBuf> {
 }
 
 impl Settings {
+    /// Sample rate kept for the device with these arguments.
+    pub fn device_rate(&self, args: &str) -> Option<f64> {
+        self.device_rates.iter().find(|(a, _)| a == args).map(|(_, r)| *r)
+    }
+
+    pub fn set_device_rate(&mut self, args: &str, rate: f64) {
+        self.device_rates.retain(|(a, _)| a != args);
+        self.device_rates.push((args.to_string(), rate));
+    }
+
     pub fn parse(text: &str) -> Self {
         let mut s = Settings::default();
         for line in text.lines() {
@@ -75,6 +88,14 @@ impl Settings {
                 "ft8_dial_hz" => s.ft8_dial_hz = value.parse().ok(),
                 "ft4_on" => s.ft4_on = value.parse().ok(),
                 "ft4_dial_hz" => s.ft4_dial_hz = value.parse().ok(),
+                // "<rate> <device arguments>"; the arguments may contain spaces.
+                "device_rate" => {
+                    if let Some((rate, args)) = value.split_once(' ') {
+                        if let Ok(rate) = rate.parse() {
+                            s.device_rates.push((args.trim().to_string(), rate));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -137,6 +158,9 @@ impl Settings {
         if let Some(d) = self.ft4_dial_hz {
             out += &format!("ft4_dial_hz={d}\n");
         }
+        for (args, rate) in &self.device_rates {
+            out += &format!("device_rate={rate} {args}\n");
+        }
         out
     }
 
@@ -180,6 +204,7 @@ mod tests {
             ft8_dial_hz: Some(10_489.54e6),
             ft4_on: Some(false),
             ft4_dial_hz: Some(14.08e6),
+            device_rates: vec![("driver=rtlsdr,label=Generic RTL2832U OEM :: 00000001".into(), 2.4e6), ("ip:192.168.1.10".into(), 3e6)],
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
     }

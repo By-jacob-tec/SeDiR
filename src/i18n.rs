@@ -64,6 +64,8 @@ pub struct Strings {
     pub language: &'static str,
     /// {} = current size in percent.
     pub zoom_tooltip: &'static str,
+    /// {} = samples per second arriving, {} = new band.
+    pub rate_lowered: &'static str,
     pub listening_caps: &'static str,
     pub start: &'static str,
     pub stop: &'static str,
@@ -174,6 +176,7 @@ pub static EN: Strings = Strings {
     app_subtitle: "Wideband SDR receiver",
     language: "Language",
     zoom_tooltip: "Text size ({} %). Also Ctrl + / Ctrl − / Ctrl 0.",
+    rate_lowered: "Only {} arrived (the link is too slow for this band): narrowed to {}.",
     listening_caps: "LISTENING FREQUENCY",
     start: "▶  Start",
     stop: "■  Stop",
@@ -297,6 +300,7 @@ pub static TR: Strings = Strings {
     app_subtitle: "Geniş bant SDR alıcı",
     language: "Dil",
     zoom_tooltip: "Yazı boyutu (% {}). Ctrl + / Ctrl − / Ctrl 0 ile de olur.",
+    rate_lowered: "Yalnızca {} geldi (bağlantı bu bant için yavaş): {} olarak daraltıldı.",
     listening_caps: "DİNLEME FREKANSI",
     start: "▶  Başlat",
     stop: "■  Durdur",

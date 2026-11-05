@@ -42,6 +42,10 @@ const STEPS: [f64; 12] = [1.0, 10.0, 100.0, 500.0, 1e3, 2.5e3, 5e3, 6.25e3, 10e3
 const MIN_SPAN: f64 = 5e3;
 /// Window width (points) from which the settings are laid out in two columns.
 const WIDE_WINDOW: f32 = 1700.0;
+/// The stream falls short below this share of the sample rate…
+const STREAM_SHORT: f64 = 0.95;
+/// …for this many one-second reports in a row: then the band is narrowed.
+const STREAM_SHORT_REPORTS: u32 = 4;
 /// Narrowest window (points) that still leaves the spectrum some room beside two columns.
 const TWO_COLUMNS_MIN: f32 = 1250.0;
 const ZOOM_STEP: f32 = 0.1;
@@ -102,6 +106,10 @@ pub struct SedirApp {
     lang: Lang,
     /// Text size is chosen (saved, or picked from the screen size on the first frames).
     zoom_ready: bool,
+    /// Stream reports in a row that fell short of the sample rate.
+    short_stats: u32,
+    /// Shown under the band choice after it was narrowed because the stream fell short.
+    rate_note: Option<String>,
     /// Height (points) the settings cards took last frame, all columns together.
     cards_height: f32,
     settings: Settings,
@@ -236,6 +244,8 @@ impl SedirApp {
             logo_tex: cc.egui_ctx.load_texture("logo", logo, TextureOptions::LINEAR),
             lang: settings.lang.unwrap_or_else(Lang::from_system),
             zoom_ready: settings.zoom.is_some(),
+            short_stats: 0,
+            rate_note: None,
             cards_height: 0.0,
             threshold_db: settings.threshold_db.unwrap_or(DEFAULT_THRESHOLD_DB),
             settings,
@@ -314,7 +324,10 @@ impl SedirApp {
         let Some(kind) = self.device().map(|d| d.kind) else { return };
         self.limits = kind.limits();
         self.driver_model.clear();
-        self.sample_rate = self.limits.max_rate;
+        // The widest band, unless a narrower one was kept for this device.
+        let kept = self.device().and_then(|d| self.settings.device_rate(&d.args));
+        self.sample_rate = kept.map_or(self.limits.max_rate, |r| self.limits.nearest_rate(r));
+        self.rate_note = None;
         self.gain_db = kind.default_gain();
         self.auto_gain = false;
         self.view = View::full(self.sample_rate);
@@ -395,6 +408,7 @@ impl SedirApp {
         }
         self.opened = false;
         self.error = None;
+        self.short_stats = 0;
         self.stats = Stats::default();
         self.frame = None;
         self.settings.device = Some(device.args);
@@ -567,7 +581,10 @@ impl SedirApp {
                     }
                 }
                 Event::Frame(frame) => self.push_frame(frame),
-                Event::Stats(s) => self.stats = s,
+                Event::Stats(s) => {
+                    self.stats = s;
+                    self.check_stream();
+                }
                 Event::Error(e) => {
                     self.error = Some(e);
                     self.handle = None;
@@ -577,7 +594,43 @@ impl SedirApp {
         }
     }
 
+    /// When fewer samples arrive than the band needs for several seconds running (the
+    /// link to the device is too slow: a Pluto on 100 Mbit Ethernet, a busy USB bus), the
+    /// band is narrowed to one the measured stream carries, and kept for the device.
+    /// Gaps in the sound go with it.
+    fn check_stream(&mut self) {
+        if !self.opened || self.stats.measured_rate <= 0.0 {
+            return;
+        }
+        if self.stats.measured_rate >= self.sample_rate * STREAM_SHORT {
+            self.short_stats = 0;
+            return;
+        }
+        self.short_stats += 1;
+        if self.short_stats < STREAM_SHORT_REPORTS {
+            return;
+        }
+        let measured = self.stats.measured_rate;
+        let lower = self.limits.rates.iter().copied().filter(|&r| r < self.sample_rate * 0.99);
+        // The widest that fits in what arrives with some room, else just the next step down.
+        let fits = lower.clone().filter(|&r| r <= measured * 0.9).fold(None, |m: Option<f64>, r| Some(m.map_or(r, |m| m.max(r))));
+        let Some(rate) = fits.or_else(|| lower.fold(None, |m: Option<f64>, r| Some(m.map_or(r, |m| m.max(r))))) else { return };
+        let t = self.t();
+        self.rate_note = Some(fill(t.rate_lowered, &[&freq::rate(measured), &freq::rate(rate)]));
+        self.set_sample_rate(rate);
+        self.keep_rate();
+    }
+
+    /// Remembers the current band for the selected device.
+    fn keep_rate(&mut self) {
+        if let Some(args) = self.device().map(|d| d.args.clone()) {
+            self.settings.set_device_rate(&args, self.sample_rate);
+            self.settings.save();
+        }
+    }
+
     fn set_sample_rate(&mut self, rate: f64) {
+        self.short_stats = 0;
         self.sample_rate = rate;
         // Zoom is kept as a fraction, so the same part of the band stays in view.
         let full = self.view.span_hz >= self.frame.map_or(self.view.span_hz, |f| f.sample_rate) * 0.999;
@@ -1148,6 +1201,11 @@ impl SedirApp {
             });
             if rate != self.sample_rate {
                 self.set_sample_rate(rate);
+                self.keep_rate();
+                self.rate_note = None;
+            }
+            if let Some(note) = &self.rate_note {
+                ui.label(RichText::new(note).size(12.0).color(WARN));
             }
 
             ui.add_space(4.0);

@@ -33,11 +33,11 @@ is recognised, tuned and demodulated.
 |---|---|---|---|
 | RTL-SDR (R820T/R828D, V3, V4) | SoapySDR | 24 MHz – 1.766 GHz | 2.4 MS/s |
 | HackRF One | SoapySDR | 1 MHz – 6 GHz | 20 MS/s |
-| ADALM-Pluto | libiio (USB or network) | 325 MHz – 3.8 GHz (wider on units with the AD9364 range) | ~4 MS/s over USB |
+| ADALM-Pluto | libiio (USB or network) | 325 MHz – 3.8 GHz (wider on units with the AD9364 range) | ~4 MS/s over USB, ~2.5 MS/s on 100 Mbit Ethernet |
 | LibreSDR / AD9361 boards | libiio (network) | 70 MHz – 6 GHz | 10 MS/s on gigabit Ethernet |
 
 Once the device is open, the range it reports replaces the nominal one. The status bar shows
-how many samples actually arrive: below 100 %, pick a narrower band.
+how many samples actually arrive. When the link cannot carry the band for a few seconds, the band\nis narrowed by itself to one it carries, and kept for that receiver.
 
 SeDiR never switches on a receiver's own bias-tee (antenna power). Feed an LNB or a preamp
 from an external bias-tee that blocks the DC towards the receiver.
@@ -135,11 +135,11 @@ tıklayınca türü tanınır, ayarlanır ve demodüle edilir.
 |---|---|---|---|
 | RTL-SDR (R820T/R828D, V3, V4) | SoapySDR | 24 MHz – 1.766 GHz | 2.4 MS/s |
 | HackRF One | SoapySDR | 1 MHz – 6 GHz | 20 MS/s |
-| ADALM-Pluto | libiio (USB ya da ağ) | 325 MHz – 3.8 GHz (AD9364 aralığı açık cihazlarda daha geniş) | USB'de ~4 MS/s |
+| ADALM-Pluto | libiio (USB ya da ağ) | 325 MHz – 3.8 GHz (AD9364 aralığı açık cihazlarda daha geniş) | USB'de ~4 MS/s, 100 Mbit Ethernet'te ~2.5 MS/s |
 | LibreSDR / AD9361 kartları | libiio (ağ) | 70 MHz – 6 GHz | gigabit Ethernet'te 10 MS/s |
 
 Cihaz açılınca bildirdiği aralık nominal aralığın yerini alır. Durum çubuğu gerçekte kaç
-örnek geldiğini gösterir: %100'ün altındaysa daha dar bir bant seçin.
+örnek geldiğini gösterir. Bağlantı bandı birkaç saniye taşıyamazsa bant kendiliğinden\ntaşıyabileceği bir genişliğe daraltılır ve o alıcı için hatırlanır.
 
 SeDiR alıcının kendi bias-tee'sini (anten beslemesi) hiçbir zaman açmaz. LNB'yi ya da ön
 yükselteci, alıcı tarafına DC geçirmeyen harici bir bias-tee ile besleyin.
