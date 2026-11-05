@@ -69,8 +69,10 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SeDiR")
-            .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([900.0, 560.0])
+            // Opens filling the screen, so every card is in view from the start. No inner
+            // size: on Windows it is applied after maximising and shrinks the window back.
+            .with_maximized(true)
             .with_icon(icon),
         ..Default::default()
     };

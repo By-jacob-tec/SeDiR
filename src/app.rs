@@ -40,6 +40,8 @@ const DEFAULT_THRESHOLD_DB: f32 = 8.0;
 const STEPS: [f64; 12] = [1.0, 10.0, 100.0, 500.0, 1e3, 2.5e3, 5e3, 6.25e3, 10e3, 12.5e3, 25e3, 100e3];
 /// Narrowest visible band offered (Hz).
 const MIN_SPAN: f64 = 5e3;
+/// Window width (points) from which the settings are laid out in two columns.
+const WIDE_WINDOW: f32 = 1700.0;
 /// Subscriber id of the listening thread at the source.
 const LISTEN_ID: u32 = 1;
 /// Blocks the listening thread may have queued (~0.6 s).
@@ -777,15 +779,20 @@ impl SedirApp {
 
     // ---- Left panel ----
 
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
+    /// Cards `cards` (indices into receiver, frequency, listen, audio, digital, view).
+    fn sidebar(&mut self, ui: &mut egui::Ui, cards: std::ops::Range<usize>) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let t = self.t();
-            card(ui, t.card_receiver, |ui| self.receiver_card(ui));
-            card(ui, t.card_frequency, |ui| self.frequency_card(ui));
-            card(ui, t.card_listen, |ui| self.listen_card(ui));
-            card(ui, t.card_audio, |ui| self.audio_card(ui));
-            card(ui, t.card_digital, |ui| self.digital_card(ui));
-            card(ui, t.card_view, |ui| self.view_card(ui));
+            for i in cards {
+                match i {
+                    0 => card(ui, t.card_receiver, |ui| self.receiver_card(ui)),
+                    1 => card(ui, t.card_frequency, |ui| self.frequency_card(ui)),
+                    2 => card(ui, t.card_listen, |ui| self.listen_card(ui)),
+                    3 => card(ui, t.card_audio, |ui| self.audio_card(ui)),
+                    4 => card(ui, t.card_digital, |ui| self.digital_card(ui)),
+                    _ => card(ui, t.card_view, |ui| self.view_card(ui)),
+                }
+            }
         });
     }
 
@@ -1632,6 +1639,19 @@ impl eframe::App for SedirApp {
         egui::Panel::bottom("status")
             .frame(egui::Frame::new().fill(DEEP).inner_margin(egui::Margin::symmetric(12, 4)))
             .show(ui, |ui| self.status_bar(ui));
+        // The settings run the full height beside the spectrum; on a wide window in two
+        // columns, so all cards are in view without scrolling.
+        let side = egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(10));
+        if ui.available_width() >= WIDE_WINDOW {
+            egui::Panel::left("sidebar_a").resizable(true).default_size(310.0).size_range(270.0..=440.0).frame(side)
+                .show(ui, |ui| self.sidebar(ui, 0..3));
+            egui::Panel::left("sidebar_b").resizable(true).default_size(310.0).size_range(270.0..=440.0)
+                .frame(side.inner_margin(egui::Margin { left: 0, ..egui::Margin::same(10) }))
+                .show(ui, |ui| self.sidebar(ui, 3..6));
+        } else {
+            egui::Panel::left("sidebar").resizable(true).default_size(310.0).size_range(270.0..=440.0).frame(side)
+                .show(ui, |ui| self.sidebar(ui, 0..6));
+        }
         self.rds = if self.mode == Mode::Wfm && self.opened { self.listener.rds() } else { None };
         if self.mode == Mode::Wfm && self.opened {
             egui::Panel::bottom("rds")
@@ -1659,12 +1679,6 @@ impl eframe::App for SedirApp {
                 .show(ui, |ui| self.data_bar(ui));
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
         }
-        egui::Panel::left("sidebar")
-            .resizable(true)
-            .default_size(310.0)
-            .size_range(270.0..=440.0)
-            .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(10)))
-            .show(ui, |ui| self.sidebar(ui));
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(10)))
             .show(ui, |ui| self.central(ui));
