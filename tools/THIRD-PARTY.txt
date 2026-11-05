@@ -1,0 +1,29 @@
+SeDiR is free software under the GNU General Public License, version 3 or later
+(LICENSE.txt). The Windows package also carries these libraries, unchanged, each
+under its own license; their source code is available from the addresses given.
+
+SoapySDR (SoapySDR.dll) - Boost Software License 1.0
+  https://github.com/pothosware/SoapySDR
+SoapyRTLSDR (lib\SoapySDR\modules0.8\rtlsdrSupport.dll) - MIT License
+  https://github.com/pothosware/SoapyRTLSDR
+SoapyHackRF (lib\SoapySDR\modules0.8\HackRFSupport.dll) - MIT License
+  https://github.com/pothosware/SoapyHackRF
+librtlsdr, RTL-SDR Blog build (rtlsdr.dll) - GNU GPL 2.0 or later
+  https://github.com/rtlsdrblog/rtl-sdr-blog
+libhackrf (hackrf.dll) - BSD 3-Clause License
+  https://github.com/greatscottgadgets/hackrf
+libiio (libiio.dll) - GNU LGPL 2.1 or later
+  https://github.com/analogdevicesinc/libiio
+libusb (libusb-1.0.dll) - GNU LGPL 2.1 or later
+  https://github.com/libusb/libusb
+pthreads-win32 (pthreadVC2.dll) - GNU LGPL 2.1 or later
+  https://sourceware.org/pthreads-win32/
+Microsoft Visual C++ runtime (vcruntime140.dll, vcruntime140_1.dll, msvcp140.dll)
+  - redistributable under the Microsoft Visual C++ Redistributable license
+
+The binaries are taken from PothosSDR (https://downloads.myriadrf.org/builds/PothosSDR/)
+and the RTL-SDR Blog driver release.
+
+FT8/FT4: the LDPC code tables, CRC and message encoding follow WSJT-X (GPL-3.0),
+https://sourceforge.net/projects/wsjt/ - by Joe Taylor K1JT, Steve Franke K9AN,
+Bill Somerville G4WJS and the WSJT-X team.
