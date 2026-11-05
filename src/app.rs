@@ -198,7 +198,7 @@ impl SedirApp {
                 FtDecoder {
                     worker: Ft8::new(&FT4),
                     on: settings.ft4_on.unwrap_or(false),
-                    dial_hz: settings.ft4_dial_hz.unwrap_or(FT4_DIALS[3].0),
+                    dial_hz: settings.ft4_dial_hz.unwrap_or(FT4_DIALS[0].0),
                 },
             ],
             correction_hz,

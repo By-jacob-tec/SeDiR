@@ -395,8 +395,10 @@ pub const DIALS: &[(f64, &str)] = &[
     (432.174e6, "70 cm"),
 ];
 
-/// Usual FT4 dial frequencies (Hz), as WSJT-X lists them.
+/// Usual FT4 dial frequencies (Hz), as WSJT-X lists them. On QO-100 FT4 shares FT8's
+/// dial: both are found in the same 3 kHz and can be decoded together.
 pub const FT4_DIALS: &[(f64, &str)] = &[
+    (10_489.540e6, "QO-100"),
     (3.575e6, "80 m"),
     (7.0475e6, "40 m"),
     (10.140e6, "30 m"),
