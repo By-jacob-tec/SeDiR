@@ -42,6 +42,10 @@ const STEPS: [f64; 12] = [1.0, 10.0, 100.0, 500.0, 1e3, 2.5e3, 5e3, 6.25e3, 10e3
 const MIN_SPAN: f64 = 5e3;
 /// Window width (points) from which the settings are laid out in two columns.
 const WIDE_WINDOW: f32 = 1700.0;
+/// Text and control size at first start; 1.0 is small on large screens.
+const DEFAULT_ZOOM: f32 = 1.25;
+const ZOOM_STEP: f32 = 0.1;
+const ZOOM_RANGE: (f32, f32) = (0.7, 2.5);
 /// Subscriber id of the listening thread at the source.
 const LISTEN_ID: u32 = 1;
 /// Blocks the listening thread may have queued (~0.6 s).
@@ -167,6 +171,7 @@ impl SedirApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_theme(&cc.egui_ctx);
         let settings = Settings::load();
+        cc.egui_ctx.set_zoom_factor(settings.zoom.unwrap_or(DEFAULT_ZOOM).clamp(ZOOM_RANGE.0, ZOOM_RANGE.1));
         let center = settings.frequency_hz.unwrap_or(DEFAULT_FREQUENCY);
         let limits = DeviceKind::Other.limits();
         let mode = settings.mode.as_deref().and_then(Mode::from_name).unwrap_or(Mode::Nfm);
@@ -772,6 +777,15 @@ impl SedirApp {
                 if self.lang != before {
                     self.settings.lang = Some(self.lang);
                     self.settings.save();
+                }
+                // Text size (also Ctrl + / Ctrl − / Ctrl 0); right to left, so A+ first.
+                ui.add_space(8.0);
+                let zoom = ui.ctx().zoom_factor();
+                for (label, step) in [("A+", ZOOM_STEP), ("A−", -ZOOM_STEP)] {
+                    let button = egui::Button::new(RichText::new(label).strong()).min_size(vec2(32.0, 26.0));
+                    if ui.add(button).on_hover_text(fill(t.zoom_tooltip, &[&format!("{:.0}", zoom * 100.0)])).clicked() {
+                        ui.ctx().set_zoom_factor((zoom + step).clamp(ZOOM_RANGE.0, ZOOM_RANGE.1));
+                    }
                 }
             });
         });
@@ -1619,6 +1633,12 @@ impl SedirApp {
 
 impl eframe::App for SedirApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Keeps the text size, whether set with the buttons or Ctrl +/−.
+        let zoom = (ui.ctx().zoom_factor() * 100.0).round() / 100.0;
+        if self.settings.zoom.unwrap_or(DEFAULT_ZOOM) != zoom {
+            self.settings.zoom = Some(zoom);
+            self.settings.save();
+        }
         self.poll_discovery();
         self.poll_events();
         self.poll_classification();

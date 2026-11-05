@@ -62,6 +62,8 @@ pub fn fill(template: &str, values: &[&dyn std::fmt::Display]) -> String {
 pub struct Strings {
     pub app_subtitle: &'static str,
     pub language: &'static str,
+    /// {} = current size in percent.
+    pub zoom_tooltip: &'static str,
     pub listening_caps: &'static str,
     pub start: &'static str,
     pub stop: &'static str,
@@ -171,6 +173,7 @@ pub struct Strings {
 pub static EN: Strings = Strings {
     app_subtitle: "Wideband SDR receiver",
     language: "Language",
+    zoom_tooltip: "Text size ({} %). Also Ctrl + / Ctrl − / Ctrl 0.",
     listening_caps: "LISTENING FREQUENCY",
     start: "▶  Start",
     stop: "■  Stop",
@@ -293,6 +296,7 @@ pub static EN: Strings = Strings {
 pub static TR: Strings = Strings {
     app_subtitle: "Geniş bant SDR alıcı",
     language: "Dil",
+    zoom_tooltip: "Yazı boyutu (% {}). Ctrl + / Ctrl − / Ctrl 0 ile de olur.",
     listening_caps: "DİNLEME FREKANSI",
     start: "▶  Başlat",
     stop: "■  Durdur",
