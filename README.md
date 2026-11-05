@@ -53,6 +53,20 @@ RTL-SDR and HackRF need the WinUSB driver; if they are not found, install it onc
 Pluto and LibreSDR over the network: type the address (e.g. `192.168.1.47`) in the receiver
 card and press Add.
 
+## Linux
+
+Download `SeDiR-<version>-linux-x64.tar.gz` (x86-64, Ubuntu 24.04 / Debian 13 or newer),
+unpack it and install the receiver libraries:
+
+```
+sudo apt install libsoapysdr0.8 soapysdr0.8-module-rtlsdr soapysdr0.8-module-hackrf \
+                 libiio0 libasound2t64 rtl-sdr hackrf
+```
+
+The `rtl-sdr` and `hackrf` packages bring the udev rules that let a normal user open the
+receivers. Then run `./sedir`; `INSTALL.txt` in the archive shows how to add it to the menu.
+Settings are kept in `~/.config/sedir/settings.txt`.
+
 ## Use
 
 - Type a frequency in the frequency card: `145.5`, `7074k`, `1.09G` (no unit means MHz).
@@ -68,14 +82,15 @@ Settings are kept in `%APPDATA%\SeDiR\settings.txt`.
 
 Requires Rust (edition 2024) and, on Windows, [PothosSDR](https://downloads.myriadrf.org/builds/PothosSDR/)
 (SoapySDR, RTL-SDR and HackRF modules, libiio). On Linux: `libsoapysdr-dev`,
-`soapysdr-module-rtlsdr`, `soapysdr-module-hackrf`, `libiio0`.
+`soapysdr-module-rtlsdr`, `soapysdr-module-hackrf`, `libiio0`, `libasound2-dev`.
 
 ```
 cargo build --release
 sedir --diagnose   # lists the receivers found
 ```
 
-`tools\package-windows.ps1` builds the Windows zip with the libraries it needs.
+`tools\package-windows.ps1` builds the Windows zip with the libraries it needs,
+`tools/package-linux.sh` the Linux archive.
 
 ## Credits
 
@@ -139,6 +154,20 @@ RTL-SDR ve HackRF WinUSB sürücüsü ister; bulunamazlarsa bir kez [Zadig](http
 ile kurun (Options → List All Devices, alıcıyı seçin, WinUSB). Ağdaki Pluto ve LibreSDR için
 alıcı kartına adresi (ör. `192.168.1.47`) yazıp Ekle'ye basın.
 
+### Linux
+
+`SeDiR-<sürüm>-linux-x64.tar.gz` dosyasını indirin (x86-64, Ubuntu 24.04 / Debian 13 ya da
+daha yenisi), açın ve alıcı kütüphanelerini kurun:
+
+```
+sudo apt install libsoapysdr0.8 soapysdr0.8-module-rtlsdr soapysdr0.8-module-hackrf \
+                 libiio0 libasound2t64 rtl-sdr hackrf
+```
+
+`rtl-sdr` ve `hackrf` paketleri, normal kullanıcının alıcıları açabilmesi için gereken udev
+kurallarını getirir. Sonra `./sedir`'i çalıştırın; menüye eklemek için arşivdeki
+`INSTALL.txt` dosyasına bakın.
+
 ### Kullanım
 
 - Frekans kartına frekansı yazın: `145.5`, `7074k`, `1.09G` (birimsiz MHz demektir).
@@ -148,20 +177,22 @@ alıcı kartına adresi (ör. `192.168.1.47`) yazıp Ekle'ye basın.
 - QO-100: dönüştürücüde "QO-100 LNB (9750 MHz)"i seçin, "Beacon'a kilitle"yi işaretleyin ve
   `10489.75` yazın.
 
-Ayarlar `%APPDATA%\SeDiR\settings.txt` dosyasında tutulur.
+Ayarlar Windows'ta `%APPDATA%\SeDiR\settings.txt`, Linux'ta `~/.config/sedir/settings.txt`
+dosyasında tutulur.
 
 ### Derleme
 
 Rust (2024 sürümü) ve Windows'ta [PothosSDR](https://downloads.myriadrf.org/builds/PothosSDR/)
 (SoapySDR, RTL-SDR ve HackRF modülleri, libiio) gerekir. Linux'ta: `libsoapysdr-dev`,
-`soapysdr-module-rtlsdr`, `soapysdr-module-hackrf`, `libiio0`.
+`soapysdr-module-rtlsdr`, `soapysdr-module-hackrf`, `libiio0`, `libasound2-dev`.
 
 ```
 cargo build --release
 sedir --diagnose   # bulunan alıcıları listeler
 ```
 
-`tools\package-windows.ps1` gereken kütüphanelerle Windows zip'ini hazırlar.
+`tools\package-windows.ps1` gereken kütüphanelerle Windows zip'ini, `tools/package-linux.sh`
+Linux arşivini hazırlar.
 
 ### Katkıda bulunanlar
 
