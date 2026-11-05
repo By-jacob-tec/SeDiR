@@ -6,10 +6,7 @@ is recognised, tuned and demodulated.
 
 *Sedir* is the Taurus cedar that grows in Muğla, Turkey.
 
-**Türkçe:** Geniş bant SDR alıcı. Alıcının taşıyabildiği en geniş bandı renkli spektrum ve
-şelale olarak gösterir, banttaki sinyalleri bulup listeler; tıklanan sinyalin türünü tanır,
-ayarlar ve demodüle eder. AM, NFM, WFM (RDS), USB, LSB, CW (metne), RTTY, PSK31, FT8, FT4.
-QO-100 için LNB ayarı ve beacon kilidi vardır. Arayüz Türkçe ve İngilizcedir.
+**Türkçe açıklama:** [aşağıda](#türkçe).
 
 ## Features
 
@@ -26,7 +23,8 @@ QO-100 için LNB ayarı ve beacon kilidi vardır. Arayüz Türkçe ve İngilizce
   message. Time comes from the PC clock: keep it on UTC (GPS or NTP).
 - **QO-100:** LNB converter setting and lock to the lower CW beacon, which corrects the
   LNB's error and drift continuously (also the receiver's own crystal error). FT8 and FT4
-  are on 10489.540 MHz.
+  are on 10489.540 MHz. The receiver is centred just below the transponder, so its DC
+  spike stays out of the signals.
 - Text size follows the screen (A− / A+ or Ctrl +/− to change); English and Turkish.
 
 ## Receivers
@@ -90,3 +88,89 @@ RDS follows IEC 62106. The libraries in the Windows package and their licenses a
 ## License
 
 GPL-3.0-or-later. A yAtölye project.
+
+## Türkçe
+
+Rust ile yazılmış geniş bant SDR alıcı: alıcının taşıyabildiği en geniş bandı renkli
+spektrum ve şelale olarak gösterir, görünen bütün sinyalleri bulup listeler. Bir sinyale
+tıklayınca türü tanınır, ayarlanır ve demodüle edilir.
+
+*Sedir*, Muğla'da yetişen Toros sediridir.
+
+### Özellikler
+
+- **Alıcılar kendiliğinden bulunur:** RTL-SDR, HackRF One, ADALM-Pluto, LibreSDR ve diğer
+  AD9361 kartları (USB ya da ağ). Cihazın aralığı dışındaki frekanslar uyarıyla reddedilir.
+- **Spektrum ve şelale** bandın tamamında, istenirse daraltılarak; sinyaller genişlik ve
+  güçleriyle bulunup listelenir; FM'de RDS'ten gelen istasyon adları gösterilir.
+- **Dinleme:** AM, NFM, RDS'li WFM, USB, LSB, CW, RTTY ve PSK31, seçtiğiniz ses cihazında.
+  Sinyalden ve bant planından otomatik tür tanıma.
+- **Metin çözme:** CW, RTTY (45.45/50/75 Bd, 170–850 Hz kayma kendiliğinden bulunur) ve PSK31,
+  spektrumun altındaki şeritte.
+- **FT8 ve FT4**, birlikte ya da ayrı; her mesaj için SNR, zaman farkı ve ses frekansı.
+  Zaman bilgisayar saatinden alınır: saati UTC'de tutun (GPS ya da NTP).
+- **QO-100:** LNB dönüştürücü ayarı ve alt CW beacon'ına kilitlenme; LNB'nin hatası ve
+  kayması (alıcının kendi kristal hatası da) sürekli düzeltilir. FT8 ve FT4 10489.540 MHz'te.
+  Alıcının merkezi transponderin hemen altına alınır, merkezdeki DC çukuru sinyallere düşmez.
+- Yazı boyutu ekrana göre seçilir (A− / A+ ya da Ctrl +/− ile değişir); Türkçe ve İngilizce.
+
+### Alıcılar
+
+| Alıcı | Arayüz | Aralık (nominal) | Kayıpsız en geniş bant |
+|---|---|---|---|
+| RTL-SDR (R820T/R828D, V3, V4) | SoapySDR | 24 MHz – 1.766 GHz | 2.4 MS/s |
+| HackRF One | SoapySDR | 1 MHz – 6 GHz | 20 MS/s |
+| ADALM-Pluto | libiio (USB ya da ağ) | 325 MHz – 3.8 GHz (AD9364 aralığı açık cihazlarda daha geniş) | USB'de ~4 MS/s |
+| LibreSDR / AD9361 kartları | libiio (ağ) | 70 MHz – 6 GHz | gigabit Ethernet'te 10 MS/s |
+
+Cihaz açılınca bildirdiği aralık nominal aralığın yerini alır. Durum çubuğu gerçekte kaç
+örnek geldiğini gösterir: %100'ün altındaysa daha dar bir bant seçin.
+
+SeDiR alıcının kendi bias-tee'sini (anten beslemesi) hiçbir zaman açmaz. LNB'yi ya da ön
+yükselteci, alıcı tarafına DC geçirmeyen harici bir bias-tee ile besleyin.
+
+### Windows
+
+`SeDiR-<sürüm>-windows-x64.zip` dosyasını [sürümler](https://github.com/sozden/SeDiR/releases)
+sayfasından indirin, istediğiniz yere açın ve `sedir.exe`'yi çalıştırın. Kurulum gerekmez:
+alıcı kütüphaneleri klasörün içindedir.
+
+RTL-SDR ve HackRF WinUSB sürücüsü ister; bulunamazlarsa bir kez [Zadig](https://zadig.akeo.ie/)
+ile kurun (Options → List All Devices, alıcıyı seçin, WinUSB). Ağdaki Pluto ve LibreSDR için
+alıcı kartına adresi (ör. `192.168.1.47`) yazıp Ekle'ye basın.
+
+### Kullanım
+
+- Frekans kartına frekansı yazın: `145.5`, `7074k`, `1.09G` (birimsiz MHz demektir).
+- Büyük göstergede bir hanenin üstünde fare tekerleği o haneyi değiştirir.
+- Spektrumda: tıklama seçer, çift tıklama ortalar, sürükleme kaydırır, tekerlek adım atar,
+  Ctrl+tekerlek yakınlaştırır.
+- QO-100: dönüştürücüde "QO-100 LNB (9750 MHz)"i seçin, "Beacon'a kilitle"yi işaretleyin ve
+  `10489.75` yazın.
+
+Ayarlar `%APPDATA%\SeDiR\settings.txt` dosyasında tutulur.
+
+### Derleme
+
+Rust (2024 sürümü) ve Windows'ta [PothosSDR](https://downloads.myriadrf.org/builds/PothosSDR/)
+(SoapySDR, RTL-SDR ve HackRF modülleri, libiio) gerekir. Linux'ta: `libsoapysdr-dev`,
+`soapysdr-module-rtlsdr`, `soapysdr-module-hackrf`, `libiio0`.
+
+```
+cargo build --release
+sedir --diagnose   # bulunan alıcıları listeler
+```
+
+`tools\package-windows.ps1` gereken kütüphanelerle Windows zip'ini hazırlar.
+
+### Katkıda bulunanlar
+
+FT8 ve FT4, Joe Taylor K1JT, Steve Franke K9AN, Bill Somerville G4WJS ve WSJT-X ekibinin
+eseridir. SeDiR'in çözücüsü kendi kodudur, ama LDPC kod tabloları, CRC ve mesaj kodlaması
+WSJT-X'ten (GPL-3.0) alınmıştır; tabloları `tools/gen_ft8_tables.sh` yeniden üretir. RDS,
+IEC 62106'ya göredir. Windows paketindeki kütüphaneler ve lisansları
+`tools/THIRD-PARTY.txt` dosyasında listelenmiştir.
+
+### Lisans
+
+GPL-3.0-or-later. Bir yAtölye projesi.
