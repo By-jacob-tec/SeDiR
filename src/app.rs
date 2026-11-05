@@ -76,6 +76,10 @@ impl FtDecoder {
 }
 /// Converter LO of a QO-100 LNB: the beacon can be followed with it.
 const QO100_LO_HZ: f64 = 9_750e6;
+/// QO-100 narrow-band transponder (Hz, from just below the lower beacon).
+const QO100_NB_HZ: (f64, f64) = (10_489.495e6, 10_490.000e6);
+/// How far below the transponder the receiver is centred, keeping its DC spike out.
+const QO100_DC_GAP_HZ: f64 = 50e3;
 /// Signals at least this wide and this far above the noise, inside the FM broadcast
 /// bands (OIRT 65.8–74 MHz included), are searched for RDS.
 const FM_MIN_WIDTH_HZ: f64 = 50e3;
@@ -366,8 +370,12 @@ impl SedirApp {
             self.entry_note = Some(note);
             return;
         }
+        // A centre saved inside the QO-100 transponder moves clear of it; the view stays.
+        let centre = self.dc_free_centre(self.center_hz);
+        let view_centre = self.center_hz + self.view.offset_hz;
+        self.center_hz = centre;
+        self.view = View { offset_hz: view_centre - centre, span_hz: self.view.span_hz }.clamped(self.sample_rate);
         let tuning = Tuning { center_hz: self.center_hz - self.lo(), sample_rate: self.sample_rate, gain: self.gain() };
-        self.view = self.view.clamped(self.sample_rate);
         let ctx = ctx.clone();
         self.handle = Some(source::spawn(device.clone(), tuning, self.view, move || ctx.request_repaint()));
         let (tx, rx) = mpsc::sync_channel(LISTEN_QUEUE);
@@ -605,6 +613,28 @@ impl SedirApp {
         }
     }
 
+    /// Receiver centre for showing `hz` in the middle of the view. Usually `hz` itself;
+    /// on QO-100 the centre goes just below the narrow-band transponder, so the receiver's
+    /// DC spike (and the notch that removes it) stays out of the signals, as long as the
+    /// whole transponder still fits in the band.
+    fn dc_free_centre(&self, hz: f64) -> f64 {
+        let in_transponder = (QO100_NB_HZ.0..=QO100_NB_HZ.1).contains(&hz);
+        let centre = QO100_NB_HZ.0 - QO100_DC_GAP_HZ;
+        let fits = centre + self.sample_rate * 0.45 >= QO100_NB_HZ.1;
+        if self.lo_hz == QO100_LO_HZ && in_transponder && fits { centre } else { hz }
+    }
+
+    /// Brings `hz` to the middle of the view, retuning the receiver (to a centre clear of
+    /// the transponder on QO-100). False when refused.
+    fn centre_on(&mut self, hz: f64) -> bool {
+        let centre = self.dc_free_centre(hz);
+        let ok = self.retune(centre);
+        if ok {
+            self.set_view(View { offset_hz: hz - self.center_hz, span_hz: self.view.span_hz });
+        }
+        ok
+    }
+
     /// Moves the listening frequency; the view follows, inside the received band when
     /// possible, otherwise by retuning.
     fn set_vfo(&mut self, hz: f64) {
@@ -622,8 +652,8 @@ impl SedirApp {
         let offset = hz - self.center_hz;
         if offset.abs() <= room {
             self.set_view(View { offset_hz: offset, span_hz: self.view.span_hz });
-        } else if self.retune(hz) {
-            self.set_view(View { offset_hz: 0.0, span_hz: self.view.span_hz });
+        } else {
+            self.centre_on(hz);
         }
     }
 
@@ -634,9 +664,8 @@ impl SedirApp {
             self.entry_note = Some((fill(t.bad_number, &[&self.entry.trim()]), BAD));
             return;
         };
-        if self.retune(hz) {
-            self.vfo_hz = self.center_hz;
-            self.set_view(View { offset_hz: 0.0, span_hz: self.view.span_hz });
+        if self.centre_on(hz.round()) {
+            self.vfo_hz = hz.round();
             self.entry.clear();
             self.settings.frequency_hz = Some(self.vfo_hz);
             self.settings.save();
@@ -1218,8 +1247,8 @@ impl SedirApp {
                     ui.selectable_value(&mut self.step_hz, s, freq::short(s));
                 }
             });
-            if ui.button(t.center).clicked() && self.retune(self.vfo_hz) {
-                self.set_view(View { offset_hz: 0.0, span_hz: self.view.span_hz });
+            if ui.button(t.center).clicked() {
+                self.centre_on(self.vfo_hz);
             }
         });
     }
@@ -1528,8 +1557,8 @@ impl SedirApp {
                 let hz = hz_of(pos.x);
                 let signal = self.signal_at(hz, 3.0 * hz_per_px);
                 self.select_at(hz, signal);
-                if response.double_clicked() && self.retune(self.vfo_hz) {
-                    self.set_view(View { offset_hz: 0.0, span_hz: self.view.span_hz });
+                if response.double_clicked() {
+                    self.centre_on(self.vfo_hz);
                 }
             }
         }
