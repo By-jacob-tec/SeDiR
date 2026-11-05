@@ -1,6 +1,6 @@
 [package]
 name = "sedir"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Wideband SDR receiver: spectrum, waterfall and click-to-listen demodulation"
