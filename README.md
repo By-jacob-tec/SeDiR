@@ -1,4 +1,8 @@
+<p align="center"><img src="assets/sedir-logo.svg" alt="SeDiR" width="300"></p>
+
 # SeDiR
+
+![SeDiR on QO-100 with a HackRF: beacon lock, CW text, FT8 and FT4 decoding](assets/screenshot.webp)
 
 Wideband SDR receiver written in Rust: a colour spectrum and waterfall over the widest band
 your receiver can carry, with every signal in view found and listed. Click a signal and it
@@ -37,7 +41,8 @@ is recognised, tuned and demodulated.
 | LibreSDR / AD9361 boards | libiio (network) | 70 MHz – 6 GHz | 10 MS/s on gigabit Ethernet |
 
 Once the device is open, the range it reports replaces the nominal one. The status bar shows
-how many samples actually arrive. When the link cannot carry the band for a few seconds, the band\nis narrowed by itself to one it carries, and kept for that receiver.
+how many samples actually arrive. When the link cannot carry the band for a few seconds, the band
+is narrowed by itself to one it carries, and kept for that receiver.
 
 SeDiR never switches on a receiver's own bias-tee (antenna power). Feed an LNB or a preamp
 from an external bias-tee that blocks the DC towards the receiver.
@@ -106,6 +111,8 @@ GPL-3.0-or-later. A yAtölye project.
 
 ## Türkçe
 
+*Yukarıdaki görüntü: QO-100'de HackRF ile beacon kilidi, CW metni, FT8 ve FT4 çözme.*
+
 Rust ile yazılmış geniş bant SDR alıcı: alıcının taşıyabildiği en geniş bandı renkli
 spektrum ve şelale olarak gösterir, görünen bütün sinyalleri bulup listeler. Bir sinyale
 tıklayınca türü tanınır, ayarlanır ve demodüle edilir.
@@ -139,7 +146,8 @@ tıklayınca türü tanınır, ayarlanır ve demodüle edilir.
 | LibreSDR / AD9361 kartları | libiio (ağ) | 70 MHz – 6 GHz | gigabit Ethernet'te 10 MS/s |
 
 Cihaz açılınca bildirdiği aralık nominal aralığın yerini alır. Durum çubuğu gerçekte kaç
-örnek geldiğini gösterir. Bağlantı bandı birkaç saniye taşıyamazsa bant kendiliğinden\ntaşıyabileceği bir genişliğe daraltılır ve o alıcı için hatırlanır.
+örnek geldiğini gösterir. Bağlantı bandı birkaç saniye taşıyamazsa bant kendiliğinden
+taşıyabileceği bir genişliğe daraltılır ve o alıcı için hatırlanır.
 
 SeDiR alıcının kendi bias-tee'sini (anten beslemesi) hiçbir zaman açmaz. LNB'yi ya da ön
 yükselteci, alıcı tarafına DC geçirmeyen harici bir bias-tee ile besleyin.
