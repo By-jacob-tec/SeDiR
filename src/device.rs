@@ -3,7 +3,8 @@
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::iio;
+use crate::civ::Model;
+use crate::{icom, iio};
 
 /// libiio's network port.
 const IIOD_PORT: u16 = 30431;
@@ -17,6 +18,8 @@ pub const PLUTO_DEFAULT_IP: &str = "192.168.2.1";
 pub enum Backend {
     Soapy,
     Iio,
+    /// Icom transceivers: CI-V and the 12 kHz IF, over USB or the network.
+    Icom,
 }
 
 /// Receiver kind; sets its nominal limits and how its gain works.
@@ -28,6 +31,12 @@ pub enum DeviceKind {
     Pluto,
     /// LibreSDR and other AD9361 boards (Zynq + AD9361 over Ethernet).
     LibreSdr,
+    /// Icom transceivers, receiving through their 12 kHz IF output.
+    Icom705,
+    Icom7300,
+    Icom7300Mk2,
+    /// Another Icom, or one on the network whose model is known once connected.
+    Icom,
     /// Any other SoapySDR device; limits come from its driver.
     Other,
 }
@@ -39,13 +48,31 @@ impl DeviceKind {
             DeviceKind::HackRf => "HackRF",
             DeviceKind::Pluto => "ADALM-Pluto",
             DeviceKind::LibreSdr => "LibreSDR / AD9361",
+            DeviceKind::Icom705 => "IC-705",
+            DeviceKind::Icom7300 => "IC-7300",
+            DeviceKind::Icom7300Mk2 => "IC-7300MK2",
+            DeviceKind::Icom => "Icom",
             DeviceKind::Other => "SoapySDR",
         }
+    }
+
+    pub fn from_icom(model: Model) -> Self {
+        match model {
+            Model::Ic705 => DeviceKind::Icom705,
+            Model::Ic7300 => DeviceKind::Icom7300,
+            Model::Ic7300Mk2 => DeviceKind::Icom7300Mk2,
+            Model::Other(_) => DeviceKind::Icom,
+        }
+    }
+
+    pub fn is_icom(self) -> bool {
+        matches!(self, DeviceKind::Icom705 | DeviceKind::Icom7300 | DeviceKind::Icom7300Mk2 | DeviceKind::Icom)
     }
 
     pub fn backend(self) -> Backend {
         match self {
             DeviceKind::Pluto | DeviceKind::LibreSdr => Backend::Iio,
+            k if k.is_icom() => Backend::Icom,
             _ => Backend::Soapy,
         }
     }
@@ -97,6 +124,26 @@ impl DeviceKind {
                 auto_gain: true,
                 weak_below_hz: None,
             },
+            // One fixed band: the IF the radio sends, ±12 kHz around its frequency (about
+            // ±5 kHz of it inside the radio's widest filter). Gain is the RF gain in percent.
+            k @ (DeviceKind::Icom705 | DeviceKind::Icom7300 | DeviceKind::Icom7300Mk2 | DeviceKind::Icom) => {
+                let model = match k {
+                    DeviceKind::Icom705 => Model::Ic705,
+                    DeviceKind::Icom7300 => Model::Ic7300,
+                    DeviceKind::Icom7300Mk2 => Model::Ic7300Mk2,
+                    _ => Model::Other(0),
+                };
+                let (min_hz, max_hz) = model.range();
+                Limits {
+                    min_hz,
+                    max_hz,
+                    rates: vec![icom::SAMPLE_RATE],
+                    max_rate: icom::SAMPLE_RATE,
+                    gain: (0.0, 100.0),
+                    auto_gain: true,
+                    weak_below_hz: None,
+                }
+            }
             DeviceKind::Other => Limits {
                 min_hz: 0.0,
                 max_hz: f64::INFINITY,
@@ -115,6 +162,8 @@ impl DeviceKind {
             DeviceKind::RtlSdr => 30.0,
             DeviceKind::HackRf => 40.0,
             DeviceKind::Pluto | DeviceKind::LibreSdr => 40.0,
+            // Full RF gain, as the radios start.
+            DeviceKind::Icom705 | DeviceKind::Icom7300 | DeviceKind::Icom7300Mk2 | DeviceKind::Icom => 100.0,
             DeviceKind::Other => 30.0,
         }
     }
@@ -184,7 +233,8 @@ impl Limits {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DeviceInfo {
     pub label: String,
-    /// "key=value,..." arguments for SoapySDR, a URI for libiio (e.g. "ip:192.168.2.1").
+    /// "key=value,..." arguments for SoapySDR, a URI for libiio (e.g. "ip:192.168.2.1"),
+    /// "icom-usb:<port>|<sound input>" or "icom:<user>:<password>@<address>" for Icom radios.
     pub args: String,
     pub kind: DeviceKind,
 }
@@ -222,10 +272,24 @@ fn identify_iio(uri: &str) -> Option<DeviceInfo> {
     Some(DeviceInfo { label, args: uri.to_string(), kind })
 }
 
-/// `address` is an IP address, a host name or a full libiio URI ("ip:…").
+/// `address` is an IP address, a host name or a full libiio URI ("ip:…"), or an Icom
+/// radio ("icom:user:password@address", or "icom-usb:COM5" for a serial port by hand).
 pub fn network_uri(address: &str) -> String {
     let address = address.trim();
+    let lower = address.to_ascii_lowercase();
+    if let Some(prefix) = [icom::USB_PREFIX, icom::NET_PREFIX].into_iter().find(|p| lower.starts_with(p)) {
+        return format!("{prefix}{}", &address[prefix.len()..]);
+    }
     if address.contains(':') && !address.starts_with('[') { address.to_string() } else { format!("ip:{address}") }
+}
+
+/// An Icom radio typed in by hand (network address or serial port).
+fn icom_by_hand(uri: &str) -> DeviceInfo {
+    let label = match uri.strip_prefix(icom::USB_PREFIX) {
+        Some(rest) => format!("Icom · {}", rest.split('|').next().unwrap_or(rest)),
+        None => icom::net_label(uri),
+    };
+    DeviceInfo { label, args: uri.to_string(), kind: DeviceKind::Icom }
 }
 
 /// Whether something answers on the libiio port, so that unreachable addresses do not
@@ -240,11 +304,23 @@ fn reachable(uri: &str) -> bool {
 /// network addresses plus the Pluto's default address. Takes up to a few seconds.
 pub fn discover(network: &[String]) -> Vec<DeviceInfo> {
     let mut found = soapy_devices();
+    let usb_icoms = icom::discover_usb();
+    for f in &usb_icoms {
+        found.push(DeviceInfo { label: f.label.clone(), args: f.args.clone(), kind: DeviceKind::from_icom(f.model) });
+    }
+    for uri in network.iter().map(|a| network_uri(a)).filter(|u| icom::is_icom(u)) {
+        // A port typed by hand that the search already found is listed once.
+        let port = uri.strip_prefix(icom::USB_PREFIX).map(|r| r.split('|').next().unwrap_or(r).to_string());
+        let known = port.is_some_and(|p| usb_icoms.iter().any(|f| f.args.starts_with(&icom::usb_args(&p, ""))));
+        if !known {
+            found.push(icom_by_hand(&uri));
+        }
+    }
     if iio::library_status().is_ok() {
         for (uri, _) in iio::scan_usb() {
             found.extend(identify_iio(&uri));
         }
-        let mut uris: Vec<String> = network.iter().map(|a| network_uri(a)).collect();
+        let mut uris: Vec<String> = network.iter().map(|a| network_uri(a)).filter(|u| !icom::is_icom(u)).collect();
         let pluto = network_uri(PLUTO_DEFAULT_IP);
         if !uris.contains(&pluto) {
             uris.push(pluto);
@@ -288,6 +364,17 @@ mod tests {
         assert_eq!(network_uri("192.168.1.47"), "ip:192.168.1.47");
         assert_eq!(network_uri("ip:pluto.local"), "ip:pluto.local");
         assert_eq!(network_uri(" pluto.local "), "ip:pluto.local");
+        assert_eq!(network_uri("ICOM:op:pw@192.168.1.50"), "icom:op:pw@192.168.1.50");
+        assert_eq!(network_uri("icom-usb:COM5"), "icom-usb:COM5");
+    }
+
+    #[test]
+    fn icom_kinds() {
+        assert_eq!(DeviceKind::Icom705.backend(), Backend::Icom);
+        assert_eq!(DeviceKind::Icom7300.limits().max_hz, 74.8e6);
+        assert_eq!(DeviceKind::Icom.limits().rates, vec![24_000.0]);
+        assert_eq!(icom_by_hand("icom:op:pw@10.0.0.5").label, "Icom · op@10.0.0.5");
+        assert_eq!(icom_by_hand("icom-usb:/dev/ttyUSB0").label, "Icom · /dev/ttyUSB0");
     }
 
     /// Lists connected receivers: `cargo test --lib discover -- --ignored --nocapture`

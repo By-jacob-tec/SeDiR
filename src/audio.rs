@@ -170,6 +170,138 @@ fn build<T: SizedSample + FromSample<f32>>(
         .map_err(|e| e.to_string())
 }
 
+// ---- Input (an Icom transceiver's USB sound card carrying its 12 kHz IF) ----
+
+/// A recording device.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InputDevice {
+    pub id: String,
+    pub name: String,
+}
+
+/// Recording devices of the default sound system.
+pub fn input_devices() -> Vec<InputDevice> {
+    let host = cpal::default_host();
+    let Ok(devices) = host.input_devices() else { return Vec::new() };
+    devices
+        .filter_map(|d| {
+            let id = d.id().ok()?.to_string();
+            let name = d.description().map(|desc| desc.name().to_string()).unwrap_or_else(|_| d.to_string());
+            Some(InputDevice { id, name })
+        })
+        .collect()
+}
+
+/// Most input kept waiting (seconds); older samples are dropped.
+const INPUT_KEEP_SECONDS: usize = 2;
+
+#[derive(Default)]
+struct InputQueue {
+    samples: VecDeque<f32>,
+    error: Option<String>,
+    dropped: u64,
+}
+
+/// An open recording stream (first channel only); recording stops when it is dropped.
+pub struct AudioInput {
+    _stream: cpal::Stream,
+    queue: Arc<(Mutex<InputQueue>, std::sync::Condvar)>,
+    pub sample_rate: u32,
+    pub name: String,
+}
+
+impl AudioInput {
+    /// Moves what has been recorded into `out`, waiting up to `timeout` for something.
+    pub fn read(&self, out: &mut Vec<f32>, timeout: std::time::Duration) -> Result<(), String> {
+        let (lock, ready) = &*self.queue;
+        let mut q = lock.lock().unwrap();
+        if q.samples.is_empty() && q.error.is_none() {
+            q = ready.wait_timeout(q, timeout).unwrap().0;
+        }
+        if let Some(e) = q.error.clone() {
+            return Err(e);
+        }
+        out.extend(q.samples.drain(..));
+        Ok(())
+    }
+
+    /// Samples dropped because nobody read them in time.
+    pub fn dropped(&self) -> u64 {
+        self.queue.0.lock().unwrap().dropped
+    }
+}
+
+/// Opens recording device `device_id` at `rate` samples per second.
+pub fn open_input(device_id: &str, rate: u32) -> Result<AudioInput, String> {
+    let host = cpal::default_host();
+    let id: cpal::DeviceId = device_id.parse().map_err(|e| format!("{e:?}"))?;
+    let device = host.device_by_id(&id).ok_or("the transceiver's sound device is not available")?;
+    let name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| device.to_string());
+    // Prefer formats with more resolution; any channel count (the first channel is used).
+    let rank = |f: SampleFormat| match f {
+        SampleFormat::F32 => 0,
+        SampleFormat::I32 => 1,
+        SampleFormat::I16 => 2,
+        SampleFormat::U16 => 3,
+        _ => 9,
+    };
+    let supported = device
+        .supported_input_configs()
+        .map_err(|e| e.to_string())?
+        .filter(|c| rank(c.sample_format()) < 9)
+        .filter_map(|c| c.try_with_sample_rate(rate))
+        .min_by_key(|c| (rank(c.sample_format()), c.channels()))
+        .ok_or_else(|| format!("{name}: {rate} Hz recording is not supported"))?;
+    let config = supported.config();
+    let queue = Arc::new((Mutex::new(InputQueue::default()), std::sync::Condvar::new()));
+    let keep = rate as usize * INPUT_KEEP_SECONDS;
+    let stream = match supported.sample_format() {
+        SampleFormat::F32 => build_input::<f32>(&device, config, queue.clone(), keep),
+        SampleFormat::I32 => build_input::<i32>(&device, config, queue.clone(), keep),
+        SampleFormat::I16 => build_input::<i16>(&device, config, queue.clone(), keep),
+        SampleFormat::U16 => build_input::<u16>(&device, config, queue.clone(), keep),
+        other => return Err(format!("unsupported sample format {other:?}")),
+    }?;
+    stream.play().map_err(|e| e.to_string())?;
+    Ok(AudioInput { _stream: stream, queue, sample_rate: rate, name })
+}
+
+fn build_input<T>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    queue: Arc<(Mutex<InputQueue>, std::sync::Condvar)>,
+    keep: usize,
+) -> Result<cpal::Stream, String>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    let channels = config.channels.max(1) as usize;
+    let errors = queue.clone();
+    device
+        .build_input_stream(
+            config,
+            move |data: &[T], _: &cpal::InputCallbackInfo| {
+                let (lock, ready) = &*queue;
+                let mut q = lock.lock().unwrap();
+                q.samples.extend(data.chunks_exact(channels).map(|frame| f32::from_sample_(frame[0])));
+                let excess = q.samples.len().saturating_sub(keep);
+                if excess > 0 {
+                    q.samples.drain(..excess);
+                    q.dropped += excess as u64;
+                }
+                ready.notify_one();
+            },
+            move |e| {
+                let (lock, ready) = &*errors;
+                lock.lock().unwrap().error = Some(e.to_string());
+                ready.notify_one();
+            },
+            None,
+        )
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

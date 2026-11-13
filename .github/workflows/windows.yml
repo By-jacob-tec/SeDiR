@@ -1,0 +1,47 @@
+# Builds the Windows package on every push and on demand (Actions → Windows → Run workflow).
+# The result (sedir.exe and the full zip) is under the run's "Artifacts".
+name: Windows
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PothosSDR (SoapySDR, RTL-SDR, HackRF, libiio)
+        shell: pwsh
+        run: |
+          $installer = "$env:RUNNER_TEMP\PothosSDR.exe"
+          curl.exe -L --fail -o $installer "https://downloads.myriadrf.org/builds/PothosSDR/PothosSDR-2021.07.25-vc16-x64.exe"
+          Start-Process -FilePath $installer -ArgumentList "/S" -Wait
+          $bin = "$env:ProgramFiles\PothosSDR\bin"
+          if (-not (Test-Path "$bin\SoapySDR.dll")) { throw "PothosSDR was not installed" }
+          # soapysdr-sys finds SoapySDR through the PATH.
+          Add-Content $env:GITHUB_PATH $bin
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test the Icom code
+        run: cargo test --release --lib -- civ:: ifiq:: icomnet:: icom:: device:: source::tests::blocks
+
+      - name: Build and package
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File tools\package-windows.ps1
+
+      - name: Upload sedir.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: sedir-exe
+          path: target/release/sedir.exe
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: SeDiR-windows-x64
+          path: dist/*.zip

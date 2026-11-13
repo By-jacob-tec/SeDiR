@@ -580,6 +580,13 @@ impl SedirApp {
                         self.set_sample_rate(rate);
                     }
                 }
+                Event::Tuned(hz) => {
+                    // Tuned on the radio itself: the band moves, and listening moves with it.
+                    let centre = hz + self.lo();
+                    self.vfo_hz += centre - self.center_hz;
+                    self.center_hz = centre;
+                    self.sync_listener();
+                }
                 Event::Frame(frame) => self.push_frame(frame),
                 Event::Stats(s) => {
                     self.stats = s;
@@ -1209,16 +1216,21 @@ impl SedirApp {
             }
 
             ui.add_space(4.0);
+            // Icom radios: the RF gain in percent; "automatic" leaves the radio's own setting.
+            let icom = self.device().is_some_and(|d| d.kind.is_icom());
             ui.horizontal(|ui| {
-                ui.label(t.gain);
+                ui.label(if icom { t.rf_gain } else { t.gain });
                 if self.limits.auto_gain && ui.checkbox(&mut self.auto_gain, t.auto_gain).changed() {
                     self.send(Command::Gain(self.gain()));
                 }
             });
             let (lo, hi) = self.limits.gain;
-            let slider = egui::Slider::new(&mut self.gain_db, lo..=hi).step_by(1.0).suffix(" dB");
+            let slider = egui::Slider::new(&mut self.gain_db, lo..=hi).step_by(1.0).suffix(if icom { " %" } else { " dB" });
             if ui.add_enabled(!self.auto_gain, slider).changed() {
                 self.send(Command::Gain(self.gain()));
+            }
+            if icom {
+                ui.label(RichText::new(t.icom_hint).size(11.0).color(MUTED));
             }
         }
 
@@ -1226,7 +1238,7 @@ impl SedirApp {
         ui.label(RichText::new(t.network_device).size(12.0).color(MUTED));
         ui.horizontal(|ui| {
             let edit = egui::TextEdit::singleline(&mut self.network_entry).hint_text(t.network_hint).desired_width(ui.available_width() - 60.0);
-            let response = ui.add_enabled(!running, edit);
+            let response = ui.add_enabled(!running, edit).on_hover_text(t.network_tooltip);
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui.add_enabled(!running, egui::Button::new(t.add)).clicked() || enter {
                 self.add_network_device(ui.ctx());

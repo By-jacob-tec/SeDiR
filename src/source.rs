@@ -90,6 +90,8 @@ pub struct Stats {
 
 pub enum Event {
     Opened(DriverInfo),
+    /// The receiver was tuned on the device itself (an Icom's dial) to this frequency (Hz).
+    Tuned(f64),
     Frame(Frame),
     Stats(Stats),
     Error(String),
@@ -121,6 +123,10 @@ pub fn spawn(device: DeviceInfo, tuning: Tuning, view: View, notify: impl Fn() +
 
 /// Samples read per block: about 20 ms, so commands take effect quickly.
 fn block_len(rate: f64) -> usize {
+    // Narrow sources (an Icom's IF, 24 kS/s) would otherwise wait most of a second per block.
+    if rate < 100e3 {
+        return ((rate / 50.0) as usize).max(256);
+    }
     ((rate / 50.0) as usize / 1024).max(16) * 1024
 }
 
@@ -199,6 +205,13 @@ fn run(
             match radio.read(&mut samples[filled..])? {
                 Some(n) => filled += n,
                 None => stats.overflows += 1,
+            }
+        }
+        if let Some(hz) = radio.take_tuned() {
+            if (hz - tuning.center_hz).abs() >= 1.0 {
+                tuning.center_hz = hz;
+                let _ = events.send(Event::Tuned(hz));
+                notify();
             }
         }
         dc.process(&mut samples);
@@ -319,6 +332,7 @@ mod tests {
         while started.elapsed() < Duration::from_secs(4) {
             match handle.events.recv_timeout(Duration::from_secs(5)) {
                 Ok(Event::Opened(d)) => println!("opened: {d:?}"),
+                Ok(Event::Tuned(hz)) => println!("tuned on the device: {hz}"),
                 Ok(Event::Frame(f)) => {
                     frames += 1;
                     last = Some(f);
@@ -342,5 +356,6 @@ mod tests {
         assert_eq!(block_len(2.4e6), 46 * 1024);
         assert_eq!(block_len(20e6), 390 * 1024);
         assert_eq!(block_len(250e3), 16 * 1024);
+        assert_eq!(block_len(24e3), 480);
     }
 }

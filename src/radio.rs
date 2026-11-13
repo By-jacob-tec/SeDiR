@@ -1,9 +1,10 @@
-//! One interface over both back ends (SoapySDR and libiio).
+//! One interface over the back ends (SoapySDR, libiio and Icom transceivers).
 
 use num_complex::Complex;
 use soapysdr::Direction::Rx;
 
 use crate::device::{Backend, DeviceInfo, DeviceKind};
+use crate::icom::IcomRadio;
 use crate::iio::IioRadio;
 
 /// Receive settings.
@@ -29,6 +30,7 @@ pub struct DriverInfo {
 pub enum Radio {
     Soapy { device: soapysdr::Device, stream: soapysdr::RxStream<Complex<f32>>, kind: DeviceKind },
     Iio(IioRadio),
+    Icom(Box<IcomRadio>),
 }
 
 fn span(ranges: &[soapysdr::Range]) -> Option<(f64, f64)> {
@@ -56,6 +58,11 @@ impl Radio {
                 let driver = DriverInfo { frequency_range: id.frequency_range, rate_range: id.rate_range, model: id.model };
                 (Radio::Iio(radio), driver)
             }
+            Backend::Icom => {
+                let radio = IcomRadio::open(&info.args)?;
+                let driver = DriverInfo { frequency_range: Some(radio.frequency_range()), rate_range: None, model: radio.model_name() };
+                (Radio::Icom(Box::new(radio)), driver)
+            }
         };
         radio.set_sample_rate(t.sample_rate)?;
         radio.set_frequency(t.center_hz)?;
@@ -70,6 +77,7 @@ impl Radio {
         match self {
             Radio::Soapy { device, .. } => device.set_frequency(Rx, 0, hz, ()).map_err(|e| e.to_string()),
             Radio::Iio(r) => r.set_frequency(hz),
+            Radio::Icom(r) => r.set_frequency(hz),
         }
     }
 
@@ -85,6 +93,7 @@ impl Radio {
                 Ok(())
             }
             Radio::Iio(r) => r.set_sample_rate(rate),
+            Radio::Icom(r) => r.set_sample_rate(rate),
         }
     }
 
@@ -109,6 +118,7 @@ impl Radio {
                 result.map_err(|e| e.to_string())
             }
             Radio::Iio(r) => r.set_gain(gain),
+            Radio::Icom(r) => r.set_gain(gain),
         }
     }
 
@@ -122,6 +132,15 @@ impl Radio {
                 Err(e) => Err(e.to_string()),
             },
             Radio::Iio(r) => r.read(out).map(Some),
+            Radio::Icom(r) => r.read(out).map(Some),
+        }
+    }
+
+    /// A frequency the receiver was tuned to by hand (the dial of an Icom transceiver).
+    pub fn take_tuned(&mut self) -> Option<f64> {
+        match self {
+            Radio::Icom(r) => r.take_tuned(),
+            _ => None,
         }
     }
 }
