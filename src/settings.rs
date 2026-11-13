@@ -19,6 +19,8 @@ pub struct Settings {
     pub mode: Option<String>,
     /// Playback device id; None for the system default.
     pub audio_device: Option<String>,
+    /// Recording device carrying an Icom radio's IF (USB); None to find it by its name.
+    pub icom_input: Option<String>,
     /// Volume in percent.
     pub volume: Option<f32>,
     /// Whether station names are read from RDS in the background.
@@ -78,6 +80,7 @@ impl Settings {
                 "zoom" => s.zoom = value.parse().ok(),
                 "mode" if !value.is_empty() => s.mode = Some(value.to_string()),
                 "audio_device" if !value.is_empty() => s.audio_device = Some(value.to_string()),
+                "icom_input" if !value.is_empty() => s.icom_input = Some(value.to_string()),
                 "volume" => s.volume = value.parse().ok(),
                 "find_names" => s.find_names = value.parse().ok(),
                 "auto_mode" => s.auto_mode = value.parse().ok(),
@@ -127,6 +130,9 @@ impl Settings {
         }
         if let Some(a) = &self.audio_device {
             out += &format!("audio_device={a}\n");
+        }
+        if let Some(i) = &self.icom_input {
+            out += &format!("icom_input={i}\n");
         }
         if let Some(v) = self.volume {
             out += &format!("volume={v}\n");
@@ -194,6 +200,7 @@ mod tests {
             zoom: Some(1.25),
             mode: Some("NFM".into()),
             audio_device: Some("wasapi:{0.0.0.00000000}.{abc}".into()),
+            icom_input: Some("wasapi:{0.0.1.00000000}.{def}".into()),
             volume: Some(70.0),
             find_names: Some(false),
             auto_mode: Some(true),

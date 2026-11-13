@@ -7,7 +7,7 @@ use eframe::egui::{
     TextureOptions, pos2, vec2,
 };
 
-use sedir::audio::{self, AudioBuffer, AudioOutput, OutputDevice, Volume};
+use sedir::audio::{self, AudioBuffer, AudioOutput, InputDevice, OutputDevice, Volume};
 use sedir::beacon::{self, BeaconStatus, QO100_BEACON_HZ, SharedBeacon};
 use sedir::classify::{self, Classification, Reason};
 use sedir::demod::Mode;
@@ -176,6 +176,8 @@ pub struct SedirApp {
     volume_pct: f32,
     muted: bool,
     audio_devices: Vec<OutputDevice>,
+    /// Recording devices, for choosing an Icom radio's sound input.
+    input_devices: Vec<InputDevice>,
     audio_device: Option<String>,
     audio: Option<AudioOutput>,
     audio_error: Option<String>,
@@ -238,6 +240,7 @@ impl SedirApp {
             volume_pct,
             muted: false,
             audio_devices: audio::output_devices(),
+            input_devices: audio::input_devices(),
             audio_device: settings.audio_device.clone(),
             audio: None,
             audio_error: None,
@@ -378,7 +381,13 @@ impl SedirApp {
     }
 
     fn start(&mut self, ctx: &egui::Context) {
-        let Some(device) = self.device().cloned() else { return };
+        let Some(mut device) = self.device().cloned() else { return };
+        // An Icom on USB records its IF from the sound input chosen for it, if any.
+        if let Some(id) = &self.settings.icom_input {
+            if sedir::icom::is_usb(&device.args) {
+                device.args = sedir::icom::with_sound(&device.args, id);
+            }
+        }
         if let Err(note) = self.frequency_note(self.center_hz) {
             self.entry_note = Some(note);
             return;
@@ -411,7 +420,8 @@ impl SedirApp {
         self.short_stats = 0;
         self.stats = Stats::default();
         self.frame = None;
-        self.settings.device = Some(device.args);
+        // As listed (without a chosen Icom sound input), so it is found again next time.
+        self.settings.device = self.device().map(|d| d.args.clone());
         self.settings.frequency_hz = Some(self.vfo_hz);
         self.settings.save();
     }
@@ -1228,6 +1238,34 @@ impl SedirApp {
             let slider = egui::Slider::new(&mut self.gain_db, lo..=hi).step_by(1.0).suffix(if icom { " %" } else { " dB" });
             if ui.add_enabled(!self.auto_gain, slider).changed() {
                 self.send(Command::Gain(self.gain()));
+            }
+            if icom && self.device().is_some_and(|d| sedir::icom::is_usb(&d.args)) {
+                ui.add_space(4.0);
+                ui.label(t.icom_input);
+                let current = self
+                    .settings
+                    .icom_input
+                    .as_ref()
+                    .and_then(|id| self.input_devices.iter().find(|d| &d.id == id))
+                    .map_or(t.icom_input_auto.to_string(), |d| d.name.clone());
+                let mut choice = self.settings.icom_input.clone();
+                ui.add_enabled_ui(!running, |ui| {
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("icom_input").width(ui.available_width() - 36.0).selected_text(current).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut choice, None, t.icom_input_auto);
+                            for d in &self.input_devices {
+                                ui.selectable_value(&mut choice, Some(d.id.clone()), &d.name);
+                            }
+                        });
+                        if ui.button("⟳").on_hover_text(t.refresh_audio).clicked() {
+                            self.input_devices = audio::input_devices();
+                        }
+                    });
+                });
+                if choice != self.settings.icom_input {
+                    self.settings.icom_input = choice;
+                    self.settings.save();
+                }
             }
             if icom {
                 ui.label(RichText::new(t.icom_hint).size(11.0).color(MUTED));

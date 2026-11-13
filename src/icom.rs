@@ -75,7 +75,20 @@ pub struct Found {
 /// Whether a recording device looks like an Icom's USB sound card.
 fn is_icom_sound(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    ["usb audio codec", "icom", "ic-7300", "ic-705"].iter().any(|k| n.contains(k))
+    ["usb audio codec", "icom", "ic-7", "ic-9", "ic-705", "ic-r", "7300"].iter().any(|k| n.contains(k))
+}
+
+/// Whether the arguments are a USB radio (whose sound input can be chosen).
+pub fn is_usb(args: &str) -> bool {
+    args.starts_with(USB_PREFIX)
+}
+
+/// USB arguments with the sound input replaced (empty: found by its name).
+pub fn with_sound(args: &str, sound_id: &str) -> String {
+    match parse_usb(args) {
+        Some((port, _)) => usb_args(port, sound_id),
+        None => args.to_string(),
+    }
 }
 
 /// Serial ports that may be an Icom radio, with the USB serial number (the IC-7300MK2
@@ -198,11 +211,17 @@ impl IcomRadio {
             let address = identify(serial.as_mut())
                 .ok_or_else(|| format!("{port}: no CI-V answer (radio on? SET > Connectors > CI-V: CI-V USB Port, Baud Rate Auto)"))?;
             let sound_id = if sound_id.is_empty() {
-                audio::input_devices()
-                    .into_iter()
-                    .find(|d| is_icom_sound(&d.name))
-                    .map(|d| d.id)
-                    .ok_or("the radio's USB sound card was not found")?
+                let inputs = audio::input_devices();
+                match inputs.iter().find(|d| is_icom_sound(&d.name)) {
+                    Some(d) => d.id.clone(),
+                    None => {
+                        let names: Vec<&str> = inputs.iter().map(|d| d.name.as_str()).collect();
+                        return Err(format!(
+                            "the radio's USB sound card was not found; choose it under \"Radio sound input\" (inputs: {})",
+                            names.join(", ")
+                        ));
+                    }
+                }
             } else {
                 sound_id.to_string()
             };
@@ -373,6 +392,10 @@ mod tests {
         assert!(is_icom_sound("Microphone (USB Audio CODEC )"));
         assert!(is_icom_sound("Mikrofon (2- USB Audio CODEC)"));
         assert!(!is_icom_sound("Microphone (Realtek High Definition Audio)"));
+        assert!(!is_icom_sound("Mikrofon (5- USB PnP Sound Device)"));
+        assert!(is_icom_sound("Microphone (IC-7300MK2 Audio)"));
+        assert_eq!(with_sound("icom-usb:COM2|old", "new"), "icom-usb:COM2|new");
+        assert_eq!(with_sound("icom:u:p@h", "new"), "icom:u:p@h");
     }
 
     #[test]
