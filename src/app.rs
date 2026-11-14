@@ -334,6 +334,26 @@ impl SedirApp {
         self.gain_db = kind.default_gain();
         self.auto_gain = false;
         self.view = View::full(self.sample_rate);
+        // FT8 / FT4 dials the receiver cannot reach move to one it can (40 m first).
+        for k in 0..self.ft.len() {
+            if self.frequency_note(self.ft[k].dial_hz).is_ok() {
+                continue;
+            }
+            let list = dials(self.ft[k].worker.protocol);
+            let reachable: Vec<f64> = list.iter().map(|d| d.0).filter(|&hz| self.frequency_note(hz).is_ok()).collect();
+            let pick = list.iter().find(|d| d.1 == "40 m" && reachable.contains(&d.0)).map(|d| d.0).or_else(|| reachable.first().copied());
+            if let Some(hz) = pick {
+                self.ft[k].dial_hz = hz;
+                self.ft[k].worker.clear();
+                self.save_ft(k);
+            }
+        }
+        // An Icom starts on the FT8 dial when the last frequency is out of its range.
+        if kind.is_icom() && self.frequency_note(self.vfo_hz).is_err() {
+            let hz = self.ft.first().map(|d| d.dial_hz).filter(|&hz| self.frequency_note(hz).is_ok()).unwrap_or(7.074e6);
+            self.vfo_hz = hz;
+            self.center_hz = hz;
+        }
         self.entry_note = self.frequency_note(self.vfo_hz).err().or_else(|| self.frequency_note(self.vfo_hz).ok().flatten());
     }
 
@@ -714,6 +734,13 @@ impl SedirApp {
             return;
         }
         self.vfo_hz = hz;
+        // A transceiver's dial follows the listening frequency.
+        if self.device().is_some_and(|d| d.kind.is_icom()) {
+            if (hz - self.center_hz).abs() >= 1.0 {
+                self.centre_on(hz);
+            }
+            return;
+        }
         let (lo, hi) = self.view_range();
         if (lo..=hi).contains(&hz) {
             return;
@@ -1000,12 +1027,14 @@ impl SedirApp {
             }
             ui.horizontal(|ui| {
                 ui.label(t.ft8_dial);
-                let list = dials(self.ft[k].worker.protocol);
+                // Only the dials this receiver can reach (e.g. 160–6 m on an IC-7300).
+                let list: Vec<(f64, &str)> =
+                    dials(self.ft[k].worker.protocol).iter().copied().filter(|d| self.frequency_note(d.0).is_ok()).collect();
                 let old = self.ft[k].dial_hz;
                 let current = list.iter().find(|d| d.0 == old).map_or_else(|| mhz_text(old), |d| d.1.to_string());
                 let mut dial = old;
                 egui::ComboBox::from_id_salt(("ft_dial", k)).selected_text(current).show_ui(ui, |ui| {
-                    for &(hz, name) in list {
+                    for &(hz, name) in &list {
                         ui.selectable_value(&mut dial, hz, format!("{name} · {}", freq::short(hz)));
                     }
                 });

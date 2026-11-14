@@ -36,6 +36,61 @@ const ANSWER_TIMEOUT: Duration = Duration::from_millis(400);
 const SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Frequency reports this soon after SeDiR tuned are taken as the radio repeating it.
 const OWN_CHANGE: Duration = Duration::from_millis(500);
+/// The radio's frequency is asked this often, so its dial is followed even when its
+/// "CI-V Transceive" is off.
+const POLL_INTERVAL: Duration = Duration::from_millis(300);
+/// Recording looked at to tell the IF from audio (2 s at 48 kHz).
+const CHECK_SAMPLES: usize = 96_000;
+
+/// Tells the 12 kHz IF (energy above ~7 kHz) from demodulated audio (energy below ~4 kHz)
+/// or silence, in the first seconds of recording.
+#[derive(Default)]
+struct IfCheck {
+    samples: usize,
+    lp1: f32,
+    lp2: f32,
+    low: f64,
+    total: f64,
+    done: bool,
+}
+
+/// What the start of the recording looked like.
+#[derive(Debug, PartialEq)]
+enum IfVerdict {
+    If,
+    Audio,
+    Silence,
+}
+
+impl IfCheck {
+    /// None until enough has been recorded, then the verdict once.
+    fn push(&mut self, x: &[f32]) -> Option<IfVerdict> {
+        if self.done {
+            return None;
+        }
+        // Two one-pole low-passes at 4 kHz (48 kHz rate).
+        const A: f32 = 0.408;
+        for &v in x {
+            self.lp1 += A * (v - self.lp1);
+            self.lp2 += A * (self.lp1 - self.lp2);
+            self.low += f64::from(self.lp2 * self.lp2);
+            self.total += f64::from(v * v);
+        }
+        self.samples += x.len();
+        if self.samples < CHECK_SAMPLES {
+            return None;
+        }
+        self.done = true;
+        let rms = (self.total / self.samples as f64).sqrt();
+        Some(if rms < 3e-5 {
+            IfVerdict::Silence
+        } else if self.low > 0.4 * self.total {
+            IfVerdict::Audio
+        } else {
+            IfVerdict::If
+        })
+    }
+}
 /// USB vendor ids: Icom's own USB (IC-705, IC-7300MK2) and the Silicon Labs bridge of
 /// the IC-7300 (whose serial number starts with the model name).
 const ICOM_VID: u16 = 0x0C26;
@@ -202,6 +257,8 @@ pub struct IcomRadio {
     /// When SeDiR last tuned the radio.
     tuned_by_us: Instant,
     last_if: Instant,
+    poll_at: Instant,
+    check: IfCheck,
 }
 
 impl IcomRadio {
@@ -251,6 +308,8 @@ impl IcomRadio {
             tuned: None,
             tuned_by_us: Instant::now(),
             last_if: Instant::now(),
+            poll_at: Instant::now(),
+            check: IfCheck::default(),
         };
         // The widest IF filter there is: AM, FIL1.
         radio.send(&civ::set_mode(address, RadioMode::Am, 1))?;
@@ -338,6 +397,10 @@ impl IcomRadio {
 
     /// Fills `out` with complex samples; waits for the radio when none are ready.
     pub fn read(&mut self, out: &mut [Complex<f32>]) -> Result<usize, String> {
+        if self.poll_at.elapsed() >= POLL_INTERVAL {
+            self.poll_at = Instant::now();
+            self.send(&civ::read_frequency(self.address))?;
+        }
         self.poll_civ();
         if self.ready.is_empty() {
             self.raw.clear();
@@ -360,6 +423,22 @@ impl IcomRadio {
                 return Ok(0);
             }
             self.last_if = Instant::now();
+            match self.check.push(&self.raw) {
+                Some(IfVerdict::Audio) => {
+                    return Err(format!(
+                        "{} sends audio, not its IF: on the radio set SET > Connectors > ACC/USB Output Select (IC-7300) or USB / LAN / WLAN AF/IF Output > Output Select = IF",
+                        self.model.name()
+                    ));
+                }
+                Some(IfVerdict::Silence) => {
+                    let input = match &self.link {
+                        Link::Usb { sound, .. } => sound.name.clone(),
+                        Link::Net(_) => "network audio".into(),
+                    };
+                    return Err(format!("{input}: silence; is this the radio's sound input, and its IF output level above 0?"));
+                }
+                _ => {}
+            }
             self.converted.clear();
             self.converter.process(&self.raw, &mut self.converted);
             self.ready.extend(self.converted.drain(..));
@@ -431,6 +510,24 @@ mod tests {
         assert!(seen.contains(&civ::set_mode(0xA4, RadioMode::Am, 1)), "{seen:02X?}");
         assert!(seen.contains(&civ::set_frequency(0xA4, 14_074_000.0)));
         assert!(seen.contains(&civ::set_rf_gain(0xA4, 128)));
+    }
+
+    fn verdict(tone_hz: f64, amplitude: f64) -> Option<IfVerdict> {
+        let x: Vec<f32> =
+            (0..CHECK_SAMPLES).map(|i| (amplitude * (std::f64::consts::TAU * tone_hz * i as f64 / 48_000.0).sin()) as f32).collect();
+        let mut c = IfCheck::default();
+        let v = c.push(&x[..1000]).or_else(|| c.push(&x[1000..]));
+        assert!(c.push(&x).is_none(), "verdict once");
+        v
+    }
+
+    #[test]
+    fn if_is_told_from_audio_and_silence() {
+        assert_eq!(verdict(12_500.0, 0.1), Some(IfVerdict::If));
+        assert_eq!(verdict(8_000.0, 0.1), Some(IfVerdict::If));
+        assert_eq!(verdict(1_000.0, 0.1), Some(IfVerdict::Audio));
+        assert_eq!(verdict(2_500.0, 0.1), Some(IfVerdict::Audio));
+        assert_eq!(verdict(1_000.0, 0.0), Some(IfVerdict::Silence));
     }
 
     /// Lists Icom radios on USB: `cargo test --lib icom_usb -- --ignored --nocapture`
