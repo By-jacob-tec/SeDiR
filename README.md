@@ -73,6 +73,9 @@ turning its dial moves SeDiR's band with it.
    network receiver field. Close RS-BA1 or wfview first: the radio takes one connection.
    The password is kept in the settings file.
 
+If the radio sends audio instead of the IF, SeDiR notices it within a second, puts the radio
+in USB and shows the about 3 kHz of audio above its frequency.
+
 SeDiR puts the radio in **AM with filter FIL1** (its widest IF) and only ever sends
 frequency, mode and RF gain: it never transmits. The gain slider is the radio's RF gain in
 percent; "Automatic" leaves it as it is. Keep USB SEND / USB keying on the radio off, as
@@ -208,6 +211,9 @@ bandı da onunla kayar.
    sonra ağ alıcısı alanına
    `icom:kullanıcı:şifre@192.168.1.50` yazıp Ekle'ye basın. Önce RS-BA1 ya da wfview'i
    kapatın: telsiz tek bağlantı kabul eder. Şifre ayar dosyasında saklanır.
+
+Telsiz IF yerine ses gönderirse SeDiR bunu bir saniye içinde fark eder, telsizi USB'ye alır
+ve frekansının üstündeki yaklaşık 3 kHz'lik sesi gösterir.
 
 SeDiR telsizi **AM ve FIL1** filtresine (en geniş IF) alır ve yalnızca frekans, mod ve RF
 kazancı gönderir: hiçbir zaman yayın yapmaz. Kazanç sürgüsü telsizin yüzde olarak RF

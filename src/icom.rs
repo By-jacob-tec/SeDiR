@@ -39,8 +39,8 @@ const OWN_CHANGE: Duration = Duration::from_millis(500);
 /// The radio's frequency is asked this often, so its dial is followed even when its
 /// "CI-V Transceive" is off.
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
-/// Recording looked at to tell the IF from audio (2 s at 48 kHz).
-const CHECK_SAMPLES: usize = 96_000;
+/// Recording looked at to tell the IF from audio (1 s at 48 kHz).
+const CHECK_SAMPLES: usize = 48_000;
 
 /// Tells the 12 kHz IF (energy above ~7 kHz) from demodulated audio (energy below ~4 kHz)
 /// or silence, in the first seconds of recording.
@@ -423,21 +423,11 @@ impl IcomRadio {
                 return Ok(0);
             }
             self.last_if = Instant::now();
-            match self.check.push(&self.raw) {
-                Some(IfVerdict::Audio) => {
-                    return Err(format!(
-                        "{} sends audio, not its IF: on the radio set SET > Connectors > ACC/USB Output Select (IC-7300) or USB / LAN / WLAN AF/IF Output > Output Select = IF",
-                        self.model.name()
-                    ));
-                }
-                Some(IfVerdict::Silence) => {
-                    let input = match &self.link {
-                        Link::Usb { sound, .. } => sound.name.clone(),
-                        Link::Net(_) => "network audio".into(),
-                    };
-                    return Err(format!("{input}: silence; is this the radio's sound input, and its IF output level above 0?"));
-                }
-                _ => {}
+            if self.check.push(&self.raw) == Some(IfVerdict::Audio) {
+                // The radio sends audio, not its IF: receive its upper sideband instead
+                // (about 3 kHz above its frequency).
+                self.converter = IfToIq::audio(f64::from(IF_RATE));
+                self.send(&civ::set_mode(self.address, RadioMode::Usb, 1))?;
             }
             self.converted.clear();
             self.converter.process(&self.raw, &mut self.converted);

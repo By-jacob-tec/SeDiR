@@ -5,6 +5,10 @@
 //! The IF is a real signal: the dial frequency sits at 12 kHz, upper sideband above it,
 //! lower sideband below. Shifting it down by 12 kHz, low-pass filtering and keeping every
 //! second sample gives complex samples at half the audio rate (24 kS/s from 48 kHz).
+//!
+//! When the radio sends demodulated audio instead (upper sideband), the audio is made
+//! complex with a filter that keeps only positive frequencies: the dial frequency is then
+//! at 0 Hz and the audio above it.
 
 use num_complex::Complex;
 
@@ -13,12 +17,17 @@ pub const IF_HZ: f64 = 12_000.0;
 /// Low-pass edge: the IF is at most ~15 kHz wide (±7.5 kHz).
 const CUTOFF_HZ: f64 = 9_000.0;
 const TAPS: usize = 95;
+/// Audio: the pass band 0.5 – 12.5 kHz, as a 6 kHz low-pass moved up to 6.5 kHz.
+const AUDIO_CENTRE_HZ: f64 = 6_500.0;
+const AUDIO_HALF_WIDTH_HZ: f64 = 6_000.0;
+const AUDIO_TAPS: usize = 127;
 
 pub struct IfToIq {
     input_rate: f64,
     phase: f64,
     step: f64,
-    taps: Vec<f32>,
+    /// Filter taps, newest-sample tap last.
+    taps: Vec<Complex<f32>>,
     history: Vec<Complex<f32>>,
     /// Next history slot written.
     pos: usize,
@@ -30,17 +39,28 @@ pub struct IfToIq {
 
 impl IfToIq {
     pub fn new(input_rate: f64, invert: bool) -> Self {
-        let taps = lowpass(CUTOFF_HZ / input_rate, TAPS);
-        Self {
-            input_rate,
-            phase: 0.0,
-            step: -std::f64::consts::TAU * IF_HZ / input_rate,
-            history: vec![Complex::new(0.0, 0.0); taps.len()],
-            taps,
-            pos: 0,
-            skip: 0,
-            invert,
-        }
+        let taps = lowpass(CUTOFF_HZ / input_rate, TAPS).into_iter().map(|t| Complex::new(t, 0.0)).collect();
+        Self::with(input_rate, -std::f64::consts::TAU * IF_HZ / input_rate, taps, invert)
+    }
+
+    /// For demodulated (upper sideband) audio: the dial at 0 Hz, the audio above it.
+    pub fn audio(input_rate: f64) -> Self {
+        let lp = lowpass(AUDIO_HALF_WIDTH_HZ / input_rate, AUDIO_TAPS);
+        let w = std::f64::consts::TAU * AUDIO_CENTRE_HZ / input_rate;
+        // Reversed: the oldest sample meets the first tap.
+        let n = lp.len();
+        let taps = (0..n)
+            .map(|k| {
+                let j = n - 1 - k;
+                let (s, c) = (w * j as f64).sin_cos();
+                Complex::new(lp[j] * c as f32, lp[j] * s as f32)
+            })
+            .collect();
+        Self::with(input_rate, 0.0, taps, false)
+    }
+
+    fn with(input_rate: f64, step: f64, taps: Vec<Complex<f32>>, invert: bool) -> Self {
+        Self { input_rate, phase: 0.0, step, history: vec![Complex::new(0.0, 0.0); taps.len()], taps, pos: 0, skip: 0, invert }
     }
 
     /// Complex sample rate produced.
@@ -67,10 +87,10 @@ impl IfToIq {
             self.skip = 1;
             let (mut re, mut im) = (0.0f32, 0.0f32);
             // Oldest sample first: the slot about to be overwritten.
-            for (k, &t) in self.taps.iter().enumerate() {
+            for (k, t) in self.taps.iter().enumerate() {
                 let h = self.history[(self.pos + k) % n];
-                re += t * h.re;
-                im += t * h.im;
+                re += t.re * h.re - t.im * h.im;
+                im += t.re * h.im + t.im * h.re;
             }
             out.push(Complex::new(re, if self.invert { -im } else { im }));
         }
@@ -139,6 +159,20 @@ mod tests {
     fn lower_sideband_lands_below_the_centre() {
         let out = convert(9_000.0, false);
         assert!(tone_power(&out, 24_000.0, -3_000.0) > 1e5 * tone_power(&out, 24_000.0, 3_000.0));
+    }
+
+    #[test]
+    fn audio_lands_above_the_centre() {
+        let rate = 48_000.0;
+        let input: Vec<f32> = (0..48_000).map(|i| (0.5 * (std::f64::consts::TAU * 1_500.0 * i as f64 / rate).cos()) as f32).collect();
+        let mut c = IfToIq::audio(rate);
+        let mut out = Vec::new();
+        c.process(&input, &mut out);
+        let out = &out[200..];
+        let at = tone_power(out, 24_000.0, 1_500.0).sqrt();
+        let mirror = tone_power(out, 24_000.0, -1_500.0).sqrt();
+        assert!((at - 0.5).abs() < 0.03, "amplitude {at}");
+        assert!(mirror < 0.005, "mirror {mirror}");
     }
 
     #[test]
