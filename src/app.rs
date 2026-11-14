@@ -27,6 +27,8 @@ use crate::settings::Settings;
 use crate::ui::palette::*;
 use crate::ui::{apply_theme, brand, card, colormap, dot, freq_tuner, metric, wheel_steps};
 
+mod tx;
+
 const WATERFALL_WIDTH: usize = 2048;
 const WATERFALL_ROWS: usize = 400;
 /// Weight of a new spectrum frame in the displayed (smoothed) one.
@@ -140,6 +142,10 @@ pub struct SedirApp {
     beacon: Option<SharedBeacon>,
     /// FT8 and FT4.
     ft: [FtDecoder; 2],
+    /// FT8 transmitting (Icom transceivers).
+    tx: tx::TxState,
+    /// The transceiver mode last asked for.
+    radio_mode: Option<sedir::civ::RadioMode>,
     sample_rate: f64,
     gain_db: f64,
     auto_gain: bool,
@@ -207,6 +213,13 @@ impl SedirApp {
         let beacon_lock = settings.beacon_lock.unwrap_or(true);
         let auto_mode = settings.auto_mode.unwrap_or(true);
         let mut app = Self {
+            tx: tx::TxState::new(
+                settings.my_call.clone().unwrap_or_default(),
+                settings.my_grid.clone().unwrap_or_default(),
+                settings.tx_hz.unwrap_or(1500.0),
+                settings.tx_level.unwrap_or(50.0),
+            ),
+            radio_mode: None,
             ft: [
                 FtDecoder {
                     worker: Ft8::new(&FT8),
@@ -453,6 +466,9 @@ impl SedirApp {
     }
 
     fn stop(&mut self) {
+        // Dropping the source unkeys the transmitter.
+        self.tx.enabled = false;
+        self.radio_mode = None;
         self.handle = None;
         self.beacon = None;
         self.opened = false;
@@ -490,6 +506,26 @@ impl SedirApp {
         self.step_hz = mode.default_step();
         self.settings.mode = Some(mode.name().to_string());
         self.settings.save();
+        self.sync_radio_mode();
+    }
+
+    /// A transceiver's own mode follows the listening mode (not while transmitting).
+    fn sync_radio_mode(&mut self) {
+        use sedir::civ::RadioMode;
+        if !self.opened || !self.device().is_some_and(|d| d.kind.is_icom()) || self.tx.enabled {
+            return;
+        }
+        let mode = match self.mode {
+            Mode::Am => RadioMode::Am,
+            Mode::Nfm | Mode::Wfm => RadioMode::Fm,
+            Mode::Lsb => RadioMode::Lsb,
+            Mode::Cw => RadioMode::Cw,
+            Mode::Usb | Mode::Rtty | Mode::Psk => RadioMode::Usb,
+        };
+        if self.radio_mode != Some(mode) {
+            self.radio_mode = Some(mode);
+            self.send(Command::RadioMode(mode, false));
+        }
     }
 
     /// Effective converter LO: nominal plus the measured or set error.
@@ -615,6 +651,12 @@ impl SedirApp {
                     if rate != self.sample_rate {
                         self.set_sample_rate(rate);
                     }
+                    self.radio_mode = None;
+                    self.sync_radio_mode();
+                }
+                Event::TxError(e) => {
+                    self.tx.enabled = false;
+                    self.tx.note = Some((fill(self.t().tx_error, &[&e]), BAD));
                 }
                 Event::Tuned(hz) => {
                     // Tuned on the radio itself: the band moves, and listening moves with it.
@@ -1113,6 +1155,7 @@ impl SedirApp {
     /// Decoded FT8 and FT4 messages together, newest at the bottom.
     fn ft8_panel(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
+        self.tx_panel(ui);
         for k in 0..self.ft.len() {
             if self.ft[k].on {
                 self.ft_status(ui, k);
@@ -1122,6 +1165,7 @@ impl SedirApp {
         // By slot start; FT8 and FT4 slots interleave. Stable, so each slot keeps its order.
         messages.sort_by_key(|m| m.slot);
         let both = self.ft.iter().all(|d| d.on);
+        let mut picked: Option<Ft8Message> = None;
         egui::ScrollArea::vertical().max_height(ui.available_height()).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
             egui::Grid::new("ft8_messages").num_columns(if both { 6 } else { 5 }).spacing(vec2(14.0, 2.0)).striped(true).show(ui, |ui| {
                 let mut heads = vec!["UTC", "dB", "DT", "Hz", t.ft8_message];
@@ -1146,11 +1190,17 @@ impl SedirApp {
                     ui.label(mono(format!("{:+3.0}", m.snr_db)));
                     ui.label(mono(format!("{:+.1}", m.dt_s)));
                     ui.label(mono(format!("{:4.0}", m.audio_hz)));
-                    ui.label(mono(m.text.clone()));
+                    // A click answers the station (FT8 transmitting).
+                    if ui.add(egui::Label::new(mono(m.text.clone())).sense(Sense::click())).clicked() && m.mode == FT8.name {
+                        picked = Some(m.clone());
+                    }
                     ui.end_row();
                 }
             });
         });
+        if let Some(m) = picked {
+            self.tx_pick(&m);
+        }
     }
 
     fn audio_card(&mut self, ui: &mut egui::Ui) {
@@ -1299,6 +1349,30 @@ impl SedirApp {
                 });
                 if choice != self.settings.icom_input {
                     self.settings.icom_input = choice;
+                    self.settings.save();
+                }
+                // Where transmit audio goes (FT8 transmitting).
+                ui.label(t.icom_output);
+                let current = self
+                    .settings
+                    .icom_output
+                    .as_ref()
+                    .and_then(|id| self.audio_devices.iter().find(|d| &d.id == id))
+                    .map_or(t.icom_input_auto.to_string(), |d| d.name.clone());
+                let mut choice = self.settings.icom_output.clone();
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("icom_output").width(ui.available_width() - 36.0).selected_text(current).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut choice, None, t.icom_input_auto);
+                        for d in &self.audio_devices {
+                            ui.selectable_value(&mut choice, Some(d.id.clone()), &d.name);
+                        }
+                    });
+                    if ui.button("⟳").on_hover_text(t.refresh_audio).clicked() {
+                        self.audio_devices = audio::output_devices();
+                    }
+                });
+                if choice != self.settings.icom_output {
+                    self.settings.icom_output = choice;
                     self.settings.save();
                 }
             }
@@ -1881,6 +1955,11 @@ impl eframe::App for SedirApp {
         }
         self.poll_discovery();
         self.poll_events();
+        self.tx_poll();
+        if self.tx.enabled {
+            // Transmissions are handed over on time.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
         self.poll_classification();
         self.update_beacon_tracker();
         self.sync_listener();

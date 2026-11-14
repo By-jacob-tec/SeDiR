@@ -136,6 +136,34 @@ impl Radio {
         }
     }
 
+    /// Transmits through a transceiver (Icom); other receivers cannot.
+    pub fn transmit(&mut self, audio: std::sync::Arc<Vec<f32>>, start_at: f64, output: Option<String>) -> Result<(), String> {
+        match self {
+            Radio::Icom(r) => r.transmit(audio, start_at, output),
+            _ => Err("this receiver cannot transmit".into()),
+        }
+    }
+
+    pub fn stop_transmit(&mut self) {
+        if let Radio::Icom(r) = self {
+            r.stop_transmit();
+        }
+    }
+
+    pub fn set_radio_mode(&mut self, mode: crate::civ::RadioMode, data: bool) -> Result<(), String> {
+        match self {
+            Radio::Icom(r) => r.set_radio_mode(mode, data),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn take_tx_error(&mut self) -> Option<String> {
+        match self {
+            Radio::Icom(r) => r.take_tx_error(),
+            _ => None,
+        }
+    }
+
     /// A frequency the receiver was tuned to by hand (the dial of an Icom transceiver).
     pub fn take_tuned(&mut self) -> Option<f64> {
         match self {

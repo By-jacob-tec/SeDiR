@@ -62,6 +62,13 @@ pub enum Command {
     /// Sends every block to this channel from now on (for demodulators).
     Subscribe(u32, SyncSender<Block>),
     Unsubscribe(u32),
+    /// Transmits audio (48 kHz) from `start_at` (Unix seconds) through a transceiver;
+    /// `output` is its sound output (USB), None to find it by name.
+    Transmit { audio: Arc<Vec<f32>>, start_at: f64, output: Option<String> },
+    /// Stops transmitting at once.
+    StopTransmit,
+    /// The transceiver's own mode (and data mode).
+    RadioMode(crate::civ::RadioMode, bool),
 }
 
 pub struct Frame {
@@ -95,6 +102,8 @@ pub enum Event {
     Frame(Frame),
     Stats(Stats),
     Error(String),
+    /// Transmitting failed (receiving goes on).
+    TxError(String),
 }
 
 /// Handle to the running source. Dropping it stops both threads and closes the device.
@@ -188,6 +197,22 @@ fn run(
                     subscribers.remove(&id);
                     Ok(())
                 }
+                Ok(Command::Transmit { audio, start_at, output }) => {
+                    if let Err(e) = radio.transmit(audio, start_at, output) {
+                        let _ = events.send(Event::TxError(e));
+                        notify();
+                    }
+                    Ok(())
+                }
+                Ok(Command::StopTransmit) => {
+                    radio.stop_transmit();
+                    Ok(())
+                }
+                Ok(Command::RadioMode(mode, data)) => {
+                    // Not worth reopening the device for.
+                    let _ = radio.set_radio_mode(mode, data);
+                    Ok(())
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             };
@@ -206,6 +231,10 @@ fn run(
                 Some(n) => filled += n,
                 None => stats.overflows += 1,
             }
+        }
+        if let Some(e) = radio.take_tx_error() {
+            let _ = events.send(Event::TxError(e));
+            notify();
         }
         if let Some(hz) = radio.take_tuned() {
             if (hz - tuning.center_hz).abs() >= 1.0 {
@@ -333,6 +362,7 @@ mod tests {
             match handle.events.recv_timeout(Duration::from_secs(5)) {
                 Ok(Event::Opened(d)) => println!("opened: {d:?}"),
                 Ok(Event::Tuned(hz)) => println!("tuned on the device: {hz}"),
+                Ok(Event::TxError(e)) => println!("transmit error: {e}"),
                 Ok(Event::Frame(f)) => {
                     frames += 1;
                     last = Some(f);

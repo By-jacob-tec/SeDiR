@@ -21,6 +21,13 @@ pub struct Settings {
     pub audio_device: Option<String>,
     /// Recording device carrying an Icom radio's IF (USB); None to find it by its name.
     pub icom_input: Option<String>,
+    /// Playback device of an Icom radio for transmitting (USB); None to find it by name.
+    pub icom_output: Option<String>,
+    /// FT8 transmitting: own call sign and grid, audio frequency (Hz) and level (%).
+    pub my_call: Option<String>,
+    pub my_grid: Option<String>,
+    pub tx_hz: Option<f64>,
+    pub tx_level: Option<f32>,
     /// Volume in percent.
     pub volume: Option<f32>,
     /// Whether station names are read from RDS in the background.
@@ -81,6 +88,11 @@ impl Settings {
                 "mode" if !value.is_empty() => s.mode = Some(value.to_string()),
                 "audio_device" if !value.is_empty() => s.audio_device = Some(value.to_string()),
                 "icom_input" if !value.is_empty() => s.icom_input = Some(value.to_string()),
+                "icom_output" if !value.is_empty() => s.icom_output = Some(value.to_string()),
+                "my_call" if !value.is_empty() => s.my_call = Some(value.to_string()),
+                "my_grid" if !value.is_empty() => s.my_grid = Some(value.to_string()),
+                "tx_hz" => s.tx_hz = value.parse().ok(),
+                "tx_level" => s.tx_level = value.parse().ok(),
                 "volume" => s.volume = value.parse().ok(),
                 "find_names" => s.find_names = value.parse().ok(),
                 "auto_mode" => s.auto_mode = value.parse().ok(),
@@ -133,6 +145,21 @@ impl Settings {
         }
         if let Some(i) = &self.icom_input {
             out += &format!("icom_input={i}\n");
+        }
+        if let Some(o) = &self.icom_output {
+            out += &format!("icom_output={o}\n");
+        }
+        if let Some(c) = &self.my_call {
+            out += &format!("my_call={c}\n");
+        }
+        if let Some(g) = &self.my_grid {
+            out += &format!("my_grid={g}\n");
+        }
+        if let Some(h) = self.tx_hz {
+            out += &format!("tx_hz={h}\n");
+        }
+        if let Some(l) = self.tx_level {
+            out += &format!("tx_level={l}\n");
         }
         if let Some(v) = self.volume {
             out += &format!("volume={v}\n");
@@ -201,6 +228,11 @@ mod tests {
             mode: Some("NFM".into()),
             audio_device: Some("wasapi:{0.0.0.00000000}.{abc}".into()),
             icom_input: Some("wasapi:{0.0.1.00000000}.{def}".into()),
+            icom_output: Some("wasapi:{0.0.0.00000000}.{ghi}".into()),
+            my_call: Some("TA2AI".into()),
+            my_grid: Some("KM37".into()),
+            tx_hz: Some(1500.0),
+            tx_level: Some(50.0),
             volume: Some(70.0),
             find_names: Some(false),
             auto_mode: Some(true),

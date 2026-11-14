@@ -1,7 +1,8 @@
 //! Icom CI-V: frames, frequencies and the few commands SeDiR uses.
 //!
 //! A frame is `FE FE <to> <from> <command…> FD`. Frequencies are ten BCD digits, least
-//! significant byte first. SeDiR only receives: it never sends a transmit command.
+//! significant byte first. The transmitter is keyed only by `set_ptt`, which SeDiR uses
+//! when the user transmits.
 
 /// Address SeDiR uses as the controller (the usual PC address).
 pub const CONTROLLER: u8 = 0xE0;
@@ -133,11 +134,24 @@ pub enum RadioMode {
     Lsb = 0x00,
     Usb = 0x01,
     Am = 0x02,
+    Cw = 0x03,
+    Rtty = 0x04,
+    Fm = 0x05,
 }
 
 /// Mode and filter (1 = FIL1, the widest by default).
 pub fn set_mode(to: u8, mode: RadioMode, filter: u8) -> Vec<u8> {
     frame(to, &[0x06, mode as u8, filter.clamp(1, 3)])
+}
+
+/// Data mode (USB-D …: transmit audio from USB / LAN) on or off, with filter FIL1.
+pub fn set_data_mode(to: u8, on: bool) -> Vec<u8> {
+    frame(to, &[0x1A, 0x06, u8::from(on), u8::from(on)])
+}
+
+/// Transmit (true) or receive (false).
+pub fn set_ptt(to: u8, transmit: bool) -> Vec<u8> {
+    frame(to, &[0x1C, 0x00, u8::from(transmit)])
 }
 
 /// RF gain 0–255 (sent as four BCD digits, most significant first).
@@ -239,6 +253,14 @@ mod tests {
         assert_eq!(parse_frequency(&[0x56, 0x34, 0x12, 0x45, 0x01]), Some(145_123_456));
         assert_eq!(parse_frequency(&[0x5A, 0, 0, 0, 0]), None);
         assert_eq!(set_frequency(0x94, 7_074_000.0), [0xFE, 0xFE, 0x94, 0xE0, 0x05, 0x00, 0x40, 0x07, 0x07, 0x00, 0xFD]);
+    }
+
+    #[test]
+    fn transmit_commands() {
+        assert_eq!(set_ptt(0xB6, true), [0xFE, 0xFE, 0xB6, 0xE0, 0x1C, 0x00, 0x01, 0xFD]);
+        assert_eq!(set_ptt(0xB6, false), [0xFE, 0xFE, 0xB6, 0xE0, 0x1C, 0x00, 0x00, 0xFD]);
+        assert_eq!(set_data_mode(0x94, true), [0xFE, 0xFE, 0x94, 0xE0, 0x1A, 0x06, 0x01, 0x01, 0xFD]);
+        assert_eq!(set_mode(0x94, RadioMode::Cw, 1), [0xFE, 0xFE, 0x94, 0xE0, 0x06, 0x03, 0x01, 0xFD]);
     }
 
     #[test]

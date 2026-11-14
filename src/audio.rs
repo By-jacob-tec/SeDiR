@@ -302,6 +302,85 @@ where
         .map_err(|e| e.to_string())
 }
 
+// ---- Transmit output (an Icom transceiver's USB sound card) ----
+
+/// Sound output to a transceiver for transmitting: plays what is queued, silence when
+/// nothing is. Stops when dropped.
+pub struct TxOutput {
+    _stream: cpal::Stream,
+    queue: Arc<Mutex<VecDeque<f32>>>,
+    pub name: String,
+}
+
+impl TxOutput {
+    pub fn play(&self, samples: &[f32]) {
+        self.queue.lock().unwrap().extend(samples);
+    }
+
+    /// Samples not yet played.
+    pub fn queued(&self) -> usize {
+        self.queue.lock().unwrap().len()
+    }
+
+    pub fn clear(&self) {
+        self.queue.lock().unwrap().clear();
+    }
+}
+
+/// Opens playback device `device_id` at `rate` for transmitting (every channel gets the
+/// same samples).
+pub fn open_tx(device_id: &str, rate: u32) -> Result<TxOutput, String> {
+    let host = cpal::default_host();
+    let id: cpal::DeviceId = device_id.parse().map_err(|e| format!("{e:?}"))?;
+    let device = host.device_by_id(&id).ok_or("the transceiver's sound output is not available")?;
+    let name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| device.to_string());
+    let rank = |f: SampleFormat| match f {
+        SampleFormat::F32 => 0,
+        SampleFormat::I16 => 1,
+        SampleFormat::I32 => 2,
+        _ => 9,
+    };
+    let supported = device
+        .supported_output_configs()
+        .map_err(|e| e.to_string())?
+        .filter(|c| rank(c.sample_format()) < 9)
+        .filter_map(|c| c.try_with_sample_rate(rate))
+        .min_by_key(|c| (rank(c.sample_format()), c.channels()))
+        .ok_or_else(|| format!("{name}: {rate} Hz playback is not supported"))?;
+    let config = supported.config();
+    let queue = Arc::new(Mutex::new(VecDeque::new()));
+    let stream = match supported.sample_format() {
+        SampleFormat::F32 => build_tx::<f32>(&device, config, queue.clone()),
+        SampleFormat::I16 => build_tx::<i16>(&device, config, queue.clone()),
+        SampleFormat::I32 => build_tx::<i32>(&device, config, queue.clone()),
+        other => return Err(format!("unsupported sample format {other:?}")),
+    }?;
+    stream.play().map_err(|e| e.to_string())?;
+    Ok(TxOutput { _stream: stream, queue, name })
+}
+
+fn build_tx<T: SizedSample + FromSample<f32>>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    queue: Arc<Mutex<VecDeque<f32>>>,
+) -> Result<cpal::Stream, String> {
+    let channels = config.channels.max(1) as usize;
+    device
+        .build_output_stream(
+            config,
+            move |data: &mut [T], _| {
+                let mut q = queue.lock().unwrap();
+                for frame in data.chunks_exact_mut(channels) {
+                    let v = q.pop_front().unwrap_or(0.0);
+                    frame.fill(T::from_sample(v.clamp(-1.0, 1.0)));
+                }
+            },
+            |e| eprintln!("transmit audio: {e}"),
+            None,
+        )
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,14 +11,17 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use num_complex::Complex;
 use serialport::{SerialPort, SerialPortType};
 
 use crate::audio::{self, AudioInput};
 use crate::civ::{self, Model, RadioMode};
-use crate::icomnet::{self, Credentials, IcomNet};
+use crate::icomnet::{self, Credentials, IcomNet, NetSender};
 use crate::ifiq::IfToIq;
 
 /// Device arguments of a USB radio: `icom-usb:<serial port>|<sound input id>`.
@@ -91,6 +94,13 @@ impl IfCheck {
         })
     }
 }
+/// The transmitter is keyed this long before the audio starts.
+const PTT_LEAD: Duration = Duration::from_millis(150);
+/// Longest transmission allowed, whatever is asked (a watchdog against a stuck PTT).
+const MAX_TRANSMIT: Duration = Duration::from_secs(30);
+/// Transmit audio sent ahead over the network (the radio buffers it).
+const NET_AHEAD: Duration = Duration::from_millis(100);
+
 /// USB vendor ids: Icom's own USB (IC-705, IC-7300MK2) and the Silicon Labs bridge of
 /// the IC-7300 (whose serial number starts with the model name).
 const ICOM_VID: u16 = 0x0C26;
@@ -259,6 +269,120 @@ pub struct IcomRadio {
     last_if: Instant,
     poll_at: Instant,
     check: IfCheck,
+    tx: Option<Transmission>,
+    /// Why the last transmission failed, not yet passed on.
+    tx_error: Arc<Mutex<Option<String>>>,
+}
+
+/// A transmission in progress (its own thread).
+struct Transmission {
+    abort: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+}
+
+/// Where the transmission thread sends CI-V and audio.
+enum TxLink {
+    Usb { serial: Box<dyn SerialPort>, output: Option<String> },
+    Net(NetSender),
+}
+
+impl TxLink {
+    fn civ(&mut self, frame: &[u8]) {
+        match self {
+            TxLink::Usb { serial, .. } => {
+                let _ = serial.write_all(frame);
+            }
+            TxLink::Net(n) => n.send_civ(frame),
+        }
+    }
+}
+
+fn unix_now() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// Sleeps until `at` (Unix seconds); false when aborted first.
+fn wait_until(at: f64, abort: &AtomicBool) -> bool {
+    loop {
+        if abort.load(Ordering::Relaxed) {
+            return false;
+        }
+        let left = at - unix_now();
+        if left <= 0.0 {
+            return true;
+        }
+        std::thread::sleep(Duration::from_secs_f64(left.min(0.02)));
+    }
+}
+
+/// Keys the transmitter at `start_at` (less the PTT lead), plays `audio` (48 kHz), and
+/// unkeys. The transmitter is always unkeyed at the end, also on errors and aborts.
+fn transmit(mut link: TxLink, address: u8, audio: Arc<Vec<f32>>, start_at: f64, abort: Arc<AtomicBool>, error: Arc<Mutex<Option<String>>>) {
+    let fail = |e: String| *error.lock().unwrap() = Some(e);
+    // USB: the radio's sound output, opened here (sound streams stay on their thread).
+    let output = match &link {
+        TxLink::Usb { output, .. } => {
+            let id = match output.clone().filter(|s| !s.is_empty()) {
+                Some(id) => Some(id),
+                None => audio::output_devices().into_iter().find(|d| is_icom_sound(&d.name)).map(|d| d.id),
+            };
+            let Some(id) = id else {
+                fail("the radio's USB sound output was not found; choose it under \"Radio sound output\"".into());
+                return;
+            };
+            match audio::open_tx(&id, IF_RATE) {
+                Ok(o) => Some(o),
+                Err(e) => {
+                    fail(e);
+                    return;
+                }
+            }
+        }
+        TxLink::Net(_) => None,
+    };
+    if !wait_until(start_at - PTT_LEAD.as_secs_f64(), &abort) {
+        return;
+    }
+    link.civ(&civ::set_ptt(address, true));
+    let keyed = Instant::now();
+    let length = Duration::from_secs_f64(audio.len() as f64 / f64::from(IF_RATE));
+    let limit = (length + Duration::from_secs(2)).min(MAX_TRANSMIT);
+    if wait_until(start_at, &abort) {
+        match (&link, &output) {
+            (TxLink::Net(net), _) => {
+                let t0 = Instant::now();
+                for (i, chunk) in audio.chunks(960).enumerate() {
+                    let due = Duration::from_millis(20 * i as u64);
+                    while t0.elapsed() + NET_AHEAD < due {
+                        if abort.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    if abort.load(Ordering::Relaxed) || keyed.elapsed() > limit {
+                        break;
+                    }
+                    let pcm: Vec<i16> = chunk.iter().map(|v| (v.clamp(-1.0, 1.0) * 32767.0) as i16).collect();
+                    net.send_audio(&pcm);
+                }
+                // What was sent ahead still has to be played.
+                std::thread::sleep(NET_AHEAD + Duration::from_millis(60));
+            }
+            (TxLink::Usb { .. }, Some(out)) => {
+                out.play(&audio);
+                while out.queued() > 0 && !abort.load(Ordering::Relaxed) && keyed.elapsed() < limit {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                out.clear();
+                // The sound card's own buffer.
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            _ => {}
+        }
+    }
+    // Twice: an unkeyed transmitter matters more than a repeated command.
+    link.civ(&civ::set_ptt(address, false));
+    link.civ(&civ::set_ptt(address, false));
 }
 
 impl IcomRadio {
@@ -310,6 +434,8 @@ impl IcomRadio {
             last_if: Instant::now(),
             poll_at: Instant::now(),
             check: IfCheck::default(),
+            tx: None,
+            tx_error: Arc::new(Mutex::new(None)),
         };
         // The widest IF filter there is: AM, FIL1.
         radio.send(&civ::set_mode(address, RadioMode::Am, 1))?;
@@ -355,6 +481,49 @@ impl IcomRadio {
             Some(g) => self.send(&civ::set_rf_gain(self.address, (g.clamp(0.0, 100.0) / 100.0 * 255.0).round() as u8)),
             None => Ok(()),
         }
+    }
+
+    /// Puts the radio in `mode` (filter FIL1), with data mode (transmit audio from USB /
+    /// LAN) on or off.
+    pub fn set_radio_mode(&mut self, mode: RadioMode, data: bool) -> Result<(), String> {
+        self.send(&civ::set_mode(self.address, mode, 1))?;
+        if matches!(mode, RadioMode::Usb | RadioMode::Lsb | RadioMode::Am | RadioMode::Fm) {
+            self.send(&civ::set_data_mode(self.address, data))?;
+        }
+        Ok(())
+    }
+
+    /// Transmits `audio` (48 kHz, −1…1) starting at `start_at` (Unix seconds), in USB
+    /// data mode. `output` is the radio's sound output (USB; None: found by its name).
+    /// A transmission still running is stopped first.
+    pub fn transmit(&mut self, audio: Arc<Vec<f32>>, start_at: f64, output: Option<String>) -> Result<(), String> {
+        self.stop_transmit();
+        self.set_radio_mode(RadioMode::Usb, true)?;
+        let link = match &self.link {
+            Link::Usb { serial, .. } => TxLink::Usb { serial: serial.try_clone().map_err(|e| format!("CI-V: {e}"))?, output },
+            Link::Net(net) => TxLink::Net(net.sender()),
+        };
+        let abort = Arc::new(AtomicBool::new(false));
+        let (a, e, address) = (abort.clone(), self.tx_error.clone(), self.address);
+        let thread = std::thread::Builder::new()
+            .name("icom-transmit".into())
+            .spawn(move || transmit(link, address, audio, start_at, a, e))
+            .map_err(|e| e.to_string())?;
+        self.tx = Some(Transmission { abort, thread });
+        Ok(())
+    }
+
+    /// Stops a transmission (unkeys at once).
+    pub fn stop_transmit(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            tx.abort.store(true, Ordering::Relaxed);
+            let _ = tx.thread.join();
+        }
+    }
+
+    /// Why the last transmission failed, once.
+    pub fn take_tx_error(&mut self) -> Option<String> {
+        self.tx_error.lock().unwrap().take()
     }
 
     /// A frequency change made on the radio (dial, band key) since the last call.
@@ -441,6 +610,14 @@ impl IcomRadio {
     }
 }
 
+impl Drop for IcomRadio {
+    fn drop(&mut self) {
+        self.stop_transmit();
+        // In case anything else keyed it.
+        let _ = self.send(&civ::set_ptt(self.address, false));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,6 +677,30 @@ mod tests {
         assert!(seen.contains(&civ::set_mode(0xA4, RadioMode::Am, 1)), "{seen:02X?}");
         assert!(seen.contains(&civ::set_frequency(0xA4, 14_074_000.0)));
         assert!(seen.contains(&civ::set_rf_gain(0xA4, 128)));
+    }
+
+    #[test]
+    fn network_radio_transmits_between_ptt_on_and_off() {
+        let radio = crate::icomnet::tests::FakeRadio::start("secret");
+        let args = format!("{NET_PREFIX}user:{}@127.0.0.1:{}", radio.password, radio.port);
+        let mut icom = IcomRadio::open(&args).expect("open");
+        let audio = Arc::new(vec![0.25f32; 4_800]); // 0.1 s
+        icom.transmit(audio, unix_now() + 0.3, None).unwrap();
+        std::thread::sleep(Duration::from_millis(900));
+        assert_eq!(icom.take_tx_error(), None);
+        let civ_seen = radio.civ_seen.lock().unwrap().clone();
+        let on = civ_seen.iter().position(|f| *f == civ::set_ptt(0xA4, true)).expect("PTT on");
+        let off = civ_seen.iter().position(|f| *f == civ::set_ptt(0xA4, false)).expect("PTT off");
+        assert!(on < off);
+        assert!(civ_seen[..on].contains(&civ::set_data_mode(0xA4, true)), "USB-D before keying");
+        // 5 × 20 ms, two packets each.
+        assert_eq!(radio.audio_seen.lock().unwrap().len(), 10);
+        // A transmission can be stopped before it starts: nothing is keyed.
+        radio.civ_seen.lock().unwrap().clear();
+        icom.transmit(Arc::new(vec![0.0; 48_000]), unix_now() + 5.0, None).unwrap();
+        icom.stop_transmit();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!radio.civ_seen.lock().unwrap().contains(&civ::set_ptt(0xA4, true)));
     }
 
     fn verdict(tone_hz: f64, amplitude: f64) -> Option<IfVerdict> {

@@ -87,8 +87,7 @@ pub struct IcomNet {
     pub civ_rx: Receiver<Vec<u8>>,
     /// Audio (or IF) samples from the radio, in packets.
     pub audio_rx: Receiver<Vec<i16>>,
-    civ: Arc<Stream>,
-    civ_seq: Arc<AtomicU16>,
+    send: NetSender,
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -162,21 +161,22 @@ impl IcomNet {
                 move || civ_loop(s, st, civ_tx)
             }),
             spawn("icom-audio", {
-                let s = shared.clone();
-                move || audio_loop(s, audio, audio_tx)
+                let (s, a) = (shared.clone(), audio.clone());
+                move || audio_loop(s, a, audio_tx)
             }),
         ];
-        Ok(Self { info, civ_rx, audio_rx, civ, civ_seq, shared, threads })
+        let send = NetSender { civ, civ_seq, audio, audio_seq: Arc::new(AtomicU16::new(0)) };
+        Ok(Self { info, civ_rx, audio_rx, send, shared, threads })
     }
 
     /// Sends one CI-V frame to the radio.
     pub fn send_civ(&self, frame: &[u8]) {
-        let seq = self.civ_seq.fetch_add(1, Ordering::Relaxed);
-        let mut p = self.civ.header(21 + frame.len(), 0x00);
-        p.extend([0xC1, frame.len() as u8, 0x00]);
-        p.extend(seq.to_be_bytes());
-        p.extend_from_slice(frame);
-        self.civ.send_tracked(p);
+        self.send.send_civ(frame);
+    }
+
+    /// A handle for sending CI-V and transmit audio from another thread.
+    pub fn sender(&self) -> NetSender {
+        self.send.clone()
     }
 
     /// Why the connection stopped working, if it did.
@@ -196,8 +196,9 @@ impl Drop for IcomNet {
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
-        self.civ.send_tracked(civ_open_close(&self.civ, &self.civ_seq, false));
-        self.civ.disconnect();
+        let civ = &self.send.civ;
+        civ.send_tracked(civ_open_close(civ, &self.send.civ_seq, false));
+        civ.disconnect();
         let control = &self.shared.control;
         let p = auth_packet(control, &mut self.shared.auth.lock().unwrap(), 0x01);
         control.send_tracked(p);
@@ -278,6 +279,49 @@ fn open_streams(c: &Credentials, ip: IpAddr, control: &Arc<Stream>, auth: &mut A
     audio.handshake().map_err(|e| format!("audio {e}"))?;
 
     Ok((info, civ, civ_seq, audio))
+}
+
+/// Sends CI-V frames and transmit audio to the radio; can be used from any thread.
+#[derive(Clone)]
+pub struct NetSender {
+    civ: Arc<Stream>,
+    civ_seq: Arc<AtomicU16>,
+    audio: Arc<Stream>,
+    audio_seq: Arc<AtomicU16>,
+}
+
+impl NetSender {
+    /// Sends one CI-V frame to the radio.
+    pub fn send_civ(&self, frame: &[u8]) {
+        let seq = self.civ_seq.fetch_add(1, Ordering::Relaxed);
+        let mut p = self.civ.header(21 + frame.len(), 0x00);
+        p.extend([0xC1, frame.len() as u8, 0x00]);
+        p.extend(seq.to_be_bytes());
+        p.extend_from_slice(frame);
+        self.civ.send_tracked(p);
+    }
+
+    /// Sends transmit audio (16-bit, 48 kHz, one channel) as RS-BA1 does: every 20 ms
+    /// (960 samples) in two packets of 1364 and 556 bytes. The caller paces it.
+    pub fn send_audio(&self, pcm: &[i16]) {
+        for chunk in pcm.chunks(960) {
+            let bytes: Vec<u8> = chunk.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let split = bytes.len().min(1364);
+            for part in [&bytes[..split], &bytes[split..]] {
+                if part.is_empty() {
+                    continue;
+                }
+                let seq = self.audio_seq.fetch_add(1, Ordering::Relaxed);
+                let mut p = self.audio.header(24 + part.len(), 0x00);
+                p.extend([0x80, 0x00]);
+                p.extend(seq.to_be_bytes());
+                p.extend([0x00, 0x00]);
+                p.extend((part.len() as u16).to_be_bytes());
+                p.extend_from_slice(part);
+                self.audio.send_tracked(p);
+            }
+        }
+    }
 }
 
 fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
@@ -761,12 +805,14 @@ pub(crate) mod tests {
         pub(crate) password: &'static str,
         stop: Arc<AtomicBool>,
         pub(crate) civ_seen: Arc<Mutex<Vec<Vec<u8>>>>,
+        pub(crate) audio_seen: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     impl FakeRadio {
         pub(crate) fn start(password: &'static str) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
             let civ_seen = Arc::new(Mutex::new(Vec::new()));
+            let audio_seen = Arc::new(Mutex::new(Vec::new()));
             for base in (47_000..48_000u16).step_by(7) {
                 let socks: Vec<_> = (0..3).filter_map(|k| UdpSocket::bind(("127.0.0.1", base + k)).ok()).collect();
                 if socks.len() < 3 {
@@ -778,9 +824,9 @@ pub(crate) mod tests {
                 thread::spawn(move || fake_control(ctl, password, st));
                 let (st, seen) = (stop.clone(), civ_seen.clone());
                 thread::spawn(move || fake_civ(civ, st, seen));
-                let st = stop.clone();
-                thread::spawn(move || fake_audio(aud, st));
-                return Self { port: base, password, stop, civ_seen };
+                let (st, seen) = (stop.clone(), audio_seen.clone());
+                thread::spawn(move || fake_audio(aud, st, seen));
+                return Self { port: base, password, stop, civ_seen, audio_seen };
             }
             panic!("no free ports");
         }
@@ -887,13 +933,15 @@ pub(crate) mod tests {
         }
     }
 
-    fn fake_audio(sock: UdpSocket, stop: Arc<AtomicBool>) {
+    fn fake_audio(sock: UdpSocket, stop: Arc<AtomicBool>, seen: Arc<Mutex<Vec<Vec<u8>>>>) {
         sock.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
         let mut buf = [0u8; 1500];
         let (mut client, mut seq, mut t) = (None, 0u16, 0u64);
         let mut next = Instant::now();
         while !stop.load(Ordering::Relaxed) {
-            fake_common(&sock, &mut buf, &mut client);
+            if let Some((_, r)) = fake_common(&sock, &mut buf, &mut client) {
+                seen.lock().unwrap().push(r);
+            }
             let Some((to, sid)) = client.clone() else {
                 next = Instant::now();
                 continue;
@@ -941,6 +989,15 @@ pub(crate) mod tests {
         assert_eq!(net.lost_packets(), 1, "packet 5 was missing");
         assert!(samples.iter().any(|&v| v > 8000), "tone arrived");
         assert_eq!(net.error(), None);
+
+        // 20 ms of transmit audio goes out as two packets, like RS-BA1's.
+        net.sender().send_audio(&[1000i16; 960]);
+        thread::sleep(Duration::from_millis(200));
+        let sent = radio.audio_seen.lock().unwrap().clone();
+        assert_eq!(sent.iter().map(|p| p.len()).collect::<Vec<_>>(), [24 + 1364, 24 + 556]);
+        assert_eq!(&sent[0][16..18], &[0x80, 0x00]);
+        assert_eq!(&sent[0][22..24], &1364u16.to_be_bytes());
+        assert_eq!(&sent[1][24..26], &1000i16.to_le_bytes());
         drop(net);
     }
 

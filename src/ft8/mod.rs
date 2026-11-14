@@ -7,6 +7,7 @@ pub mod decode;
 pub mod ldpc;
 pub mod message;
 pub mod tables;
+pub mod tx;
 pub mod worker;
 
 /// What differs between FT8 and FT4; the decoder works from this.
