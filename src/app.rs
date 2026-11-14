@@ -165,6 +165,10 @@ pub struct SedirApp {
     stations: Stations,
     find_names: bool,
     rds: Option<RdsInfo>,
+    /// Everything decoded from CW while listening (the decoder keeps only the latest text).
+    cw_log: String,
+    /// The decoder's text when last looked at.
+    cw_seen: String,
     auto_mode: bool,
     /// Recognition in progress.
     classifying: Option<Receiver<Option<Classification>>>,
@@ -224,6 +228,8 @@ impl SedirApp {
             stations: Stations::new(find_names),
             find_names,
             rds: None,
+            cw_log: String::new(),
+            cw_seen: String::new(),
             mode,
             bandwidth_hz: mode.default_bandwidth(),
             squelch_on: false,
@@ -1740,8 +1746,25 @@ impl SedirApp {
         });
     }
 
-    /// Text decoded from the CW signal listened to, with its speed and a key light.
-    fn cw_bar(&self, ui: &mut egui::Ui) {
+    /// Adds what the CW decoder found since the last look to the log.
+    fn update_cw_log(&mut self) {
+        let text = self.listener.cw().unwrap_or_default().text;
+        if text == self.cw_seen {
+            return;
+        }
+        let added = cw_added(&self.cw_seen, &text);
+        self.cw_log.push_str(&added);
+        let count = self.cw_log.chars().count();
+        if count > CW_LOG_CHARS {
+            let cut = self.cw_log.char_indices().nth(count - CW_LOG_CHARS).map_or(0, |(i, _)| i);
+            self.cw_log.drain(..cut);
+        }
+        self.cw_seen = text;
+    }
+
+    /// Text decoded from the CW signal listened to: speed, key light and everything
+    /// decoded so far, in a panel that can be made taller.
+    fn cw_panel(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
         let info = self.listener.cw().unwrap_or_default();
         ui.horizontal(|ui| {
@@ -1751,18 +1774,24 @@ impl SedirApp {
                 .sense(Sense::hover());
             ui.add(badge).on_hover_text(t.cw_tooltip);
             dot(ui, if info.key_down { AMBER } else { MUTED.gamma_multiply(0.4) });
+            ui.label(RichText::new(mhz_text(self.vfo_hz)).size(12.0).monospace().color(MUTED));
             if info.signal {
                 ui.label(RichText::new(format!("{:.0} WPM", info.wpm)).size(12.0).monospace().color(MUTED));
-            }
-            if info.text.is_empty() {
+            } else if self.cw_log.is_empty() {
                 ui.label(RichText::new(t.cw_waiting).size(12.0).color(MUTED));
-            } else {
-                // The latest text, right-aligned so new letters stay in view.
-                let width = ui.available_width();
-                let chars = (width / 9.5) as usize;
-                let shown: String = info.text.chars().rev().take(chars).collect::<Vec<_>>().into_iter().rev().collect();
-                ui.label(RichText::new(shown).size(16.0).monospace().color(TEXT));
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(t.cw_clear).clicked() {
+                    self.cw_log.clear();
+                }
+                if ui.button(t.cw_copy).clicked() {
+                    ui.ctx().copy_text(self.cw_log.clone());
+                }
+            });
+        });
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+            ui.add(egui::Label::new(RichText::new(&self.cw_log).size(18.0).monospace().color(TEXT)).wrap());
         });
     }
 
@@ -1905,9 +1934,15 @@ impl eframe::App for SedirApp {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
         }
         if self.mode == Mode::Cw && self.opened {
+            self.update_cw_log();
+            // Like the FT8 panel: drag its top edge to make it taller.
             egui::Panel::bottom("cw")
+                .resizable(true)
+                .default_size(200.0)
+                .size_range(90.0..=700.0)
                 .frame(egui::Frame::new().fill(CARD).inner_margin(egui::Margin::symmetric(14, 6)))
-                .show(ui, |ui| self.cw_bar(ui));
+                .show(ui, |ui| self.cw_panel(ui));
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
         }
         if self.mode.is_data() && self.opened {
             egui::Panel::bottom("data")
@@ -1964,6 +1999,28 @@ fn default_zoom(height: f32) -> f32 {
 fn volume_gain(percent: f32) -> f32 {
     let v = percent / 100.0;
     v * v * 1.5
+}
+
+/// CW text kept in the panel (characters).
+const CW_LOG_CHARS: usize = 20_000;
+
+/// What `now` (the decoder's latest text, which drops old letters from its start) adds
+/// to `before`. A new start (the decoder was reset) begins a new line.
+fn cw_added(before: &str, now: &str) -> String {
+    if before.is_empty() {
+        return now.to_string();
+    }
+    if let Some(rest) = now.strip_prefix(before) {
+        return rest.to_string();
+    }
+    // The decoder dropped letters from the start: find where `before`'s end is in `now`.
+    let starts: Vec<usize> = before.char_indices().map(|(i, _)| i).collect();
+    for &i in &starts[1..] {
+        if let Some(rest) = now.strip_prefix(&before[i..]) {
+            return rest.to_string();
+        }
+    }
+    format!("\n{now}")
 }
 
 /// Badge and band colour of slot decoder `k` (FT8, FT4).
@@ -2039,6 +2096,16 @@ fn shift_row(row: &mut [Color32], shift: isize, empty: Color32) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cw_log_takes_only_new_letters() {
+        assert_eq!(cw_added("", "CQ"), "CQ");
+        assert_eq!(cw_added("CQ", "CQ CQ"), " CQ");
+        // The decoder dropped "CQ" from its start and added "DE".
+        assert_eq!(cw_added("CQ TA2", "TA2 DE"), " DE");
+        assert_eq!(cw_added("ÇQ ÖĞ", "ÖĞ X"), " X");
+        assert_eq!(cw_added("CQ", "TEST"), "\nTEST");
+    }
     use super::*;
 
     #[test]

@@ -30,6 +30,9 @@ jobs:
       - name: Test the Icom code
         run: "cargo test --release --lib -- civ:: ifiq:: icomnet:: icom:: device:: source::tests::blocks"
 
+      - name: Test the CW panel log
+        run: cargo test --release --bin sedir cw_log
+
       - name: Build and package
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File tools\package-windows.ps1
